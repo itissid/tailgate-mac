@@ -1,43 +1,82 @@
-# Tailgate Mac — offline prototype
+# Tailgate for Mac
 
-An agent proposes access. A person reviews the exact policy change in a native Mac window and approves one simulated write with Touch ID. The sample permits `tag:demo-client` → `tag:workload-demo-api` on TCP 443 and includes tests denying TCP 22 and 80. This is a standalone project, not an AgentsView plugin.
+**Let an agent propose a Tailscale policy change. Keep the credentials, the diff, and the decision on your Mac.**
 
-## Try it
+An agent can call Tailgate and wait: it submits a bounded `.tailgate` proposal on stdin and receives a status receipt. You don't run the command or locate a file. A manual file picker is also available. Submission alone does not contact Tailscale. When you choose **Review**, the trusted app compiles an allowed change, asks Tailscale to validate the full candidate, and displays the exact bytes it would send. Touch ID authorizes **that one request**, not a session in which the agent can make additional changes.
 
-On this Mac, Apple's Command Line Tools with Swift 6.1.2 are sufficient. No full Xcode app, third-party Swift package, account, or credential is required.
+**Release status:** buildable source with an offline demo and a guarded live policy/browser-enrollment path. No pre-signed binary is distributed here. A regular `swift run` build cannot access the live credential store. Live deployment requires a Developer ID–signed, provisioned installation and human acceptance checks. **Live auth-key minting is disabled**, not silently substituted for browser enrollment.
+
+## Try it without an account
+
+Requires macOS 13+ and Swift 6.1+ (Apple Command Line Tools work; the full Xcode app is not needed to build or test). No external Swift package dependencies.
 
 ```sh
-cd ~/workspace/tailgate-mac
-swift build
+git clone https://github.com/itissid/tailgate-mac.git
+cd tailgate-mac
+swift build -c release
 swift test --disable-xctest
-swift run tailgate-preview --stdin < Examples/browser.json   # read-only, no prompt
-swift run TailgateReview                                    # human-run native window
+swift run tailgate-preview --stdin < Examples/browser.json  # read-only, no prompt
+swift run TailgateReview                                   # starts in offline mode
 ```
 
-The window starts with the browser example. Choose **Review policy diff…**, inspect both the line diff and the complete request body, then approve or discard. The prompt includes the review fingerprint prefix. A Mac without enrolled, available Touch ID cannot approve. For the second path, restart the app and paste `Examples/key.json`. The **first** approval applies only the fixture policy; **another** review and touch are required to simulate issuing a key. Use “Check fixture enrollment” to see the waiting state, then “Simulate an authorized fixture VM joining” to finish. No VM is contacted. Closing/quitting discards the fixture. The preview CLI cannot execute even a simulated write.
+The offline example allows `tag:demo-client` → `tag:workload-demo-api` on **TCP 443** and tests that **TCP 22 and 80 remain denied**. The offline demo also models a separately approved key request and delivery failure without creating a bearer key. None of the demo, preview or automated tests needs OAuth or writes to a tailnet.
 
-## What is implemented
+## Agent → human → Tailscale
 
-| Boundary | Behavior |
+```mermaid
+sequenceDiagram
+    participant Agent
+    participant Mac as Signed Tailgate app
+    actor You
+    participant SE as Secure Enclave
+    participant TS as Tailscale
+    Agent->>Mac: Submit local .tailgate on stdin and wait
+    Mac-->>You: Pending request (no automatic authentication)
+    You->>Mac: Review this proposal
+    Mac->>TS: Read policy + inventory; validate candidate (no policy write)
+    Mac-->>You: Agent's unverified purpose, compiled diff, exact request
+    You->>SE: Approve this review with Touch ID
+    SE-->>Mac: Signature over the immutable review
+    Mac->>Mac: Verify signature, freshness and single-use journal
+    Mac->>TS: OAuth-authenticated POST with original If-Match
+    TS-->>Mac: Applied, stale, or unconfirmed
+    Mac-->>Agent: Redacted receipt; enrollment is separate
+```
+
+Once a trusted release is installed and provisioned, the **agent** runs:
+
+```sh
+Scripts/tailgate-submit --wait < Examples/browser.tailgate
+```
+
+See the [submission and receipt contract](Docs/submit-and-wait.md). A missing or `unknown` receipt is **not permission to retry**.
+
+The **agent's words aren't policy**. Tailgate displays them as unverified context and signs the context together with the compiled operation. Never put a transcript, password, token, real device inventory, or personal information in the file. Start with [`Examples/browser.tailgate`](Examples/browser.tailgate) or the [agent handoff format](Docs/agent-handoff.md). No agent socket, chat integration, clipboard watcher, automatic file opener, or shell executor is required.
+
+## What the live path will and won't do
+
+| Situation | Result |
 |---|---|
-| Proposal → compiler | Bounded ASCII JSON; no unknown/duplicate fields, URLs, shell, wildcards, arbitrary owners or unrelated policy edits. Only the fixed closed baseline and `demo-vm` are supported. Grants are **to** a fresh workload tag, from the existing client tag, on explicit TCP/UDP ports. Per-protocol allow tests must cover precisely the allowed ports; deny samples cannot overlap. These checks are local; they do not run Tailscale's policy engine. |
-| Compiler → review | The app constructs the review, including the target, path, base ETag, prospective wire body, tag, VM and enrollment mode. Each review has an independent ID, full SHA-256 fingerprint, and 120-second monotonic deadline. No agent-supplied summary. |
-| Approval → simulator | Fresh biometric-only `LAContext`; no application password fallback. The session consumes its review before prompting, verifies expiry and invalidation after the prompt, then uses the saved operation—not another copy from the proposer. Fixture policy replacement checks `If-Match` at the write itself. |
-| Browser enrollment | No key or post-hoc retagging. Wait for a separately authorized fixture node with both the pinned identity and exactly the reviewed tag. Name and tag alone are insufficient. |
-| Explicit key enrollment | Separate approval for one new, non-reusable, non-preauthorized, single-tag key with a **simulated** 300-second lifetime. Receiver pin is trusted fixture configuration, not a proposal field. An issuance/delivery receipt and one-time redemption state stand in for a secret; **no bearer value exists**. |
-| Failure | The app distinguishes policy applied, key not attempted, issue unknown, delivery failed, delivery recorded, and enrollment verified. On unknown outcomes it stops. It never automatically retries issuance, revokes a key, or rolls back policy. |
+| Missing or overly broad policy, unknown fields, wildcard selector, existing destination tag | Refuses. Only a narrow [policy subset](Docs/policy-subset.md) is supported. It never replaces an incompatible policy with the demo baseline. |
+| Candidate fails validation or a negative assertion | No write. Validation tests policy semantics, not packet delivery or VM health. |
+| Review edited, discarded, expired, replayed, or policy ETag changed | Requires a new review. The writer uses the exact validated bytes with `If-Match`, never an unconditional POST. |
+| POST times out, returns an unfamiliar success format, or the app crashes mid-write | Stops. A durable local lock blocks new writes. Reconcile is read-only, not “try again.” No automatic rollback. |
+| Browser enrollment | A human signs in on the intended VM. The app checks the pinned node key, exact tag, authorization, and applied policy. It never logs in, retags, or enrolls another machine on your behalf. |
+| Proposal requests an auth key | **Refused before applying policy in live mode.** Tailscale's policy ETag does not guard key issuance, a bearer key isn't VM-bound, and this project has no provisioned private receiver or verified 300-second API lifetime. No key-creation endpoint is implemented. |
 
-`Sources/TailgateCore/Policy.swift` compiles proposals. `DryRun.swift` owns reviews, state transitions and the in-memory fixture. `Sources/TailgateReview/` contains the UI and biometric gate. Swift Testing covers the compiler and state machine with a test gate; it does **not** certify the hardware, signed application identity, live API or recipient channel.
+**Trust model:** Tailscale authenticates an OAuth token; it does **not** verify the biometric signature. Locally the signed app verifies the signature against its pinned Secure Enclave public key. macOS restricts the Data Protection Keychain items to the signed application's private access group. The installed code, signing process, host and administrator remain trusted. A stolen token or compromised signed release can bypass this local gate. Tag freshness is checked against inventory, not guaranteed by a distributed lock against other administrators.
 
-## Before any live implementation
+## Provisioning and verification
 
-**Do not put an OAuth credential in this repo, this development binary, agent tools, shell environment, proposal, or tests.** The development build is replaceable code run by the same user as the agent. `ReviewGate` is a simulator seam, not an OS security boundary. There is no live transport, Keychain item, daemon, CLI executor, remotely callable approval endpoint, or “enable live” switch.
+1. [Build, sign, notarize and install](Docs/signing.md) the trusted app. Keep signing and provisioning materials outside the repo and unavailable to untrusted agents. Do not loosen the runtime checks to get a development build working.
+2. Use distinct, narrowly scoped reader/writer OAuth clients and an independent VM node-key pin. See the [API contract and scope table](Docs/api-contract.md) and [browser enrollment contract](Docs/enrollment.md). Enter credentials into the installed app's secure setup fields, **never** chat, shell, CI, a proposal, or GitHub.
+3. In a dedicated test tailnet, use the [operator acceptance checklist](Docs/acceptance.md). Hardware authentication, production signing, actual server behavior, and successful enrollment are **not** certified by mock tests.
 
-1. **Establish the trusted endpoint first.** Ship a separately built and verified signed, hardened Mac app under administrator-controlled installation/update paths. Exclude debugging and code injection; isolate untrusted agents from the credential-bearing user/session, accessibility automation, UI injection, and approval IPC. The agent may supply *data only*. Pin one explicit tailnet ID, origin and operation set; never trust caller URLs or redirects. Refuse a host where these assumptions do not hold.
-2. **Bind credential use to the approved plan.** Provision credentials out of band to the signed app only, with macOS Keychain code identity/access controls, device-only storage and biometric protection tested against another local process. Bind a fresh, locally stored transaction to the digest, target, version and operation; Touch ID is authentication, **not** an OS signature over a JSON document. No general token-return API. Protect tokens in memory; do not print secrets to logs, crash reports, command lines, clipboard, files or mesh. Keep a protected journal of sanitized step IDs, hashes, and outcomes across restart; a pending/unknown write cannot become a retry after a crash.
-3. **Minimize and verify scopes.** Separate policy writer (`policy_file`), inventory reader (`devices:core:read`) and tag-constrained key issuer (`auth_keys`) where practical; verify [scope prerequisites and tag restrictions](https://tailscale.com/docs/reference/trust-credentials) for the target configuration. A policy writer is powerful; its scope alone does not limit it to the reviewed diff. The fixture makes the new tag admin-owned and models no actual OAuth authority to mint for it. If a separate narrowly scoped issuer cannot use precisely that tag, disable the key path. Do not widen `tagOwners`, add credential tags, or grant a broader client scope automatically.
-4. **Reconcile policy and inventory.** A live tailnet is not the fixture. Preserve existing policy/comments, model all selectors and defaults, verify tag freshness against trusted inventory, check that existing wildcard grants won't widen access, and require server validation of the exact candidate and tests. Until supported, reject the policy. Fetch the policy plus its ETag; if missing or unsupported, stop. Send the exact reviewed bytes only with the original `If-Match`; HTTP 412 requires a new diff and approval. After an ambiguous reply, read back and reconcile; do not infer the write succeeded or resend it. Verify response format/media types against the actual API contract before implementing transport.
-5. **Enrollment is a separate trust decision.** For browser mode, the human uses the official login flow on the intended VM. Require an authenticated, out-of-band association between that VM and the expected node identity; do not accept a hostname or “latest joined” match. Wait for authorization and exact tags, with timeout/cancel. If the browser path cannot establish that tagged identity, stop rather than silently retagging or falling back to a key. For key mode, authenticate a VM-local receiver against an independently provisioned pin before issuance. Deliver over that private channel directly into a trusted enrollment helper; no agent-readable store or stdout. If the agent controls the receiving OS, delivery secrecy cannot be promised: **disable this path**.
-6. **Do not infer live key guarantees from the demo.** Policy `If-Match` does not make `/keys` an atomic conditional request. Recheck current policy before issuing; if the deployment requires atomic policy-to-key binding and cannot ensure it, keep key mode disabled. Auth keys are bearer credentials; pinning the delivery destination does not make a copied real key cryptographically VM-bound. Confirm the service supports the reviewed short TTL and flags (public [auth-key docs](https://tailscale.com/docs/features/access-control/auth-keys) describe 1–90 days). Never silently round up a TTL or assume a failed delivery undid issuance. Stop and report; any cleanup write needs its own reviewed plan.
+| Code | Responsibility |
+|---|---|
+| `Sources/TailgateCore` | Strict proposal compiler, handoff format, offline simulator |
+| `Sources/TailgateLive` | Code identity, Keychain, biometric signing, pinned API origin, transactions and enrollment checks |
+| `Sources/TailgateReview` | Operator-controlled native offline/live windows |
+| `Sources/TailgatePreview` | Read-only fixture preview; no dependency on the live module |
 
-References: [Tailscale policy syntax](https://tailscale.com/docs/reference/syntax/policy-file), [policy client implementation](https://github.com/tailscale/tailscale/blob/main/client/tailscale/acl.go), [tags and ownership](https://tailscale.com/docs/features/tags), [OAuth clients](https://tailscale.com/docs/features/oauth-clients). No tailnet API behavior was tested live. A live build, credential provisioning, policy changes, key issuance, and device enrollment are outside this prototype and require separate human authorization.
+Before publishing changes, run `python3 Scripts/check-public.py` and `python3 -m unittest discover -s Tests/Privacy`. The [local privacy checks](Tests/Privacy/README.md) are heuristic. The scan covers reachable history, staged files and nonignored working files. It is a guardrail, not proof that no identifying detail exists. Only fictional examples belong in this repository.
