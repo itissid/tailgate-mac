@@ -1,0 +1,184 @@
+#!/usr/bin/python3
+"""Untrusted caller adapter: fixed installed app, one stdin frame, redacted receipt.
+No credentials, network, user-provided executables, URLs, callbacks, or fallback.
+"""
+import fcntl
+import json
+import os
+import plistlib
+import pwd
+import selectors
+import signal
+import stat
+import subprocess
+import sys
+import time
+
+APP = '/Applications/Tailgate.app'
+EXECUTABLE = APP + '/Contents/MacOS/TailgateReview'
+STATUSES = {'declined': 'not_attempted', 'rejected': 'not_attempted',
+            'expired': 'not_attempted', 'stale': 'not_applied',
+            'applied': 'applied', 'unknown': 'unknown'}
+MAX_RECEIPT = 1024
+
+
+def receipt(status):
+    return {'version': 1, 'status': status, 'write_outcome': STATUSES[status],
+            'enrollment': 'not_confirmed'}
+
+
+def parse_result(raw, code):
+    # Anything missing, truncated, duplicated, unsolicited, or inconsistent is
+    # unknown. Never forward the child's raw stdout, stderr or error messages.
+    if not raw or len(raw) > MAX_RECEIPT:
+        return receipt('unknown')
+    try:
+        def unique(pairs):
+            obj = {}
+            for key, value in pairs:
+                if key in obj:
+                    raise ValueError('duplicate')
+                obj[key] = value
+            return obj
+        value = json.loads(raw, object_pairs_hook=unique)
+        if not isinstance(value, dict) or type(value.get('version')) is not int:
+            return receipt('unknown')
+        status = value.get('status')
+        if status not in STATUSES or value != receipt(status):
+            return receipt('unknown')
+        expected = 0 if status == 'applied' else 3 if status == 'unknown' else 2
+        return receipt(status) if code == expected else receipt('unknown')
+    except (ValueError, TypeError, UnicodeError):
+        return receipt('unknown')
+
+
+def safe_environment():
+    user = pwd.getpwuid(os.getuid())
+    return {'PATH': '/usr/bin:/bin:/usr/sbin:/sbin', 'HOME': user.pw_dir,
+            'USER': user.pw_name, 'LOGNAME': user.pw_name,
+            'LANG': 'en_US.UTF-8', 'LC_ALL': 'en_US.UTF-8'}
+
+
+def verify_installation():
+    # No symlink, group/world-writable entry, foreign owner or alternate executable.
+    # MacTrust repeats stricter runtime/ACL/profile/private-group checks before use.
+    pending = [APP]
+    entries = 0
+    while pending:
+        path = pending.pop()
+        info = os.lstat(path)
+        entries += 1
+        if entries > 4096 or info.st_uid != 0 or info.st_mode & 0o022:
+            raise ValueError('installation')
+        if stat.S_ISDIR(info.st_mode):
+            with os.scandir(path) as listing:
+                pending.extend(entry.path for entry in listing)
+        elif not stat.S_ISREG(info.st_mode):
+            raise ValueError('installation')
+    with open(APP + '/Contents/Info.plist', 'rb') as stream:
+        info = plistlib.load(stream)
+    if info.get('CFBundleExecutable') != 'TailgateReview' or info.get('CFBundleIdentifier') != 'dev.tailgate.mac':
+        raise ValueError('installation')
+    if not os.access(EXECUTABLE, os.X_OK):
+        raise ValueError('installation')
+    requirement = ('anchor apple generic and identifier "dev.tailgate.mac" '
+                   'and certificate leaf[field.1.2.840.113635.100.6.1.13] exists')
+    checked = subprocess.run(['/usr/bin/codesign', '--verify', '--deep', '--strict',
+                              '-R', requirement, APP], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             env=safe_environment(), timeout=15, check=False)
+    if checked.returncode:
+        raise ValueError('installation')
+
+
+def acquire_lock():
+    # Wrapper-level single-user launch exclusion; not an approval authority. A
+    # malicious same-user client can cause denial of service, not obtain a write.
+    path = '/tmp/dev.tailgate.submit-' + str(os.getuid()) + '.lock'
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077 or info.st_nlink != 1:
+            raise ValueError('lock')
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def stop(child):
+    if child.poll() is None:
+        child.terminate()
+        try:
+            child.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait()
+
+
+def wait_once(child, caller_pid):
+    output = bytearray()
+    end = time.monotonic() + 360
+    with selectors.DefaultSelector() as selector:
+        selector.register(child.stdout, selectors.EVENT_READ)
+        while True:
+            if time.monotonic() >= end or os.getppid() != caller_pid or caller_pid <= 1:
+                stop(child)
+                return receipt('unknown')
+            for key, _ in selector.select(timeout=0.25):
+                chunk = os.read(key.fd, 1024)
+                if not chunk:
+                    try:
+                        code = child.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        stop(child)
+                        return receipt('unknown')
+                    return parse_result(bytes(output), code)
+                output.extend(chunk)
+                if len(output) > MAX_RECEIPT:
+                    stop(child)
+                    return receipt('unknown')
+
+
+def main():
+    if sys.argv[1:] != ['--wait']:
+        return receipt('rejected')
+    lock = None
+    child = None
+    caller_pid = os.getppid()
+    try:
+        lock = acquire_lock()
+        verify_installation()
+        if os.getppid() != caller_pid or caller_pid <= 1:
+            return receipt('rejected')
+        # stdin is inherited, never named in argv. Do not use `open`/LaunchServices:
+        # it may route to an unrelated running instance or detach the result pipe.
+        child = subprocess.Popen([EXECUTABLE, '--submit-and-wait'], stdin=sys.stdin,
+                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                 env=safe_environment(), cwd='/', bufsize=0,
+                                 close_fds=True, start_new_session=True)
+        return wait_once(child, caller_pid)
+    except (Exception, KeyboardInterrupt):
+        if child is not None:
+            stop(child)
+            return receipt('unknown')
+        return receipt('rejected')
+    finally:
+        if lock is not None:
+            os.close(lock)  # retain inode; unlinking would create lock races
+
+
+def interrupted(_signum, _frame):
+    raise InterruptedError('interrupted')
+
+
+if __name__ == '__main__':
+    signal.signal(signal.SIGTERM, interrupted)
+    result = main()
+    encoded = (json.dumps(result, separators=(',', ':')) + '\n').encode('ascii')
+    try:
+        os.write(sys.stdout.fileno(), encoded)
+    except (BrokenPipeError, OSError):
+        pass  # caller disconnect is never converted into successful receipt
+    sys.exit(0 if result['status'] == 'applied' else 3 if result['status'] == 'unknown' else 2)

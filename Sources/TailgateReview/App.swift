@@ -51,10 +51,15 @@ import TailgateCore
 
 @MainActor private struct Workbench: View {
     @StateObject private var model = Model()
+    @Environment(\.openWindow) private var openWindow
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Tailgate  /  Offline review").font(.title2.bold())
-            Text("This app has no Tailscale connection. Quitting discards the fixture and all approvals.").foregroundStyle(.secondary)
+            HStack {
+                Text("Tailgate  /  Offline review").font(.title2.bold())
+                Spacer()
+                Button("Open live review window…") { openWindow(id: "live-review") }
+            }
+            Text("This window uses an offline fixture only. Quitting discards the fixture and all approvals.").foregroundStyle(.secondary)
             Divider()
             if let review = model.review {
                 Text("SHA-256  \(review.fingerprint)").font(.system(.caption, design: .monospaced)).textSelection(.enabled)
@@ -93,9 +98,19 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular); NSApp.activate(ignoringOtherApps: true)
     }
+    func applicationWillTerminate(_ notification: Notification) {
+        if SubmissionRuntime.isSubmission { SubmissionRuntime.close() }
+    }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 }
 @main struct TailgateApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
-    var body: some Scene { Window("Tailgate — offline only", id: "review") { Workbench() } }
+    var body: some Scene {
+        Window(SubmissionRuntime.isSubmission ? "Tailgate — agent request" : "Tailgate — offline review", id: "review") {
+            if SubmissionRuntime.isSubmission { SubmissionWindow() } else { Workbench() }
+        }
+        Window("Tailgate — live policy review", id: "live-review") {
+            if SubmissionRuntime.isSubmission { Text("Setup and other reviews are unavailable in this submission session.") } else { LiveWorkbench() }
+        }
+    }
 }
