@@ -344,6 +344,7 @@ import UniformTypeIdentifiers
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
                     configuration
+                    LookupProvisionForm().disabled(model.busy)
                     Text("Untrusted proposal JSON").font(.headline)
                     Text("Paste data only. Preparing checks the current policy and candidate; it does not authorize a write.")
                         .font(.callout).foregroundStyle(.secondary)
@@ -373,7 +374,7 @@ import UniformTypeIdentifiers
     }
 
     private var configuration: some View {
-        DisclosureGroup("Private setup — save or replace configuration", isExpanded: $model.setupExpanded) {
+        DisclosureGroup("Private setup — provision policy clients once", isExpanded: $model.setupExpanded) {
             VStack(alignment: .leading, spacing: 10) {
                 Text("Enter values obtained independently of the agent. Leave this section alone to use previously saved setup. No credentials go to the proposal, clipboard, logs, or repository.")
                     .font(.callout).foregroundStyle(.secondary)

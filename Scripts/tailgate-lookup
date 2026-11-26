@@ -1,0 +1,170 @@
+#!/usr/bin/python3
+"""One exact device lookup, disclosed only by the installed app after human approval.
+No credentials, endpoint override, caller-selected executable, or raw child output.
+"""
+import importlib.machinery
+import importlib.util
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+import selectors
+import signal
+import subprocess
+import sys
+import time
+
+MAX_RESULT = 8192
+FIELDS = ('name', 'name,tags', 'name,ips', 'name,tags,ips')
+FAILURES = ('rejected', 'declined', 'expired', 'unknown')
+
+
+def common():
+    # Reuse the submit adapter's verifier, environment and launch exclusion. Loading
+    # a sibling module supplies no authority; the installed app checks trust again.
+    filename = str(Path(__file__).resolve().with_name('tailgate-submit'))
+    loader = importlib.machinery.SourceFileLoader('tailgate_submit_adapter', filename)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def failure(status='rejected'):
+    return {'version': 1, 'status': status}
+
+
+def hostname(name):
+    return isinstance(name, str) and re.fullmatch(r'[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?', name) is not None
+
+
+def query(arguments):
+    if len(arguments) != 4 or arguments[0] != '--name' or arguments[2] != '--fields':
+        raise ValueError('query')
+    name, fields = arguments[1], arguments[3]
+    if not hostname(name) or fields not in FIELDS:
+        raise ValueError('query')
+    return name, fields, ('TAILGATE-LOOKUP/1\n' + name + '\n' + fields + '\n').encode('ascii')
+
+
+def parse_result(raw, code, name, fields):
+    if not raw or len(raw) > MAX_RESULT:
+        return failure('unknown')
+    try:
+        def unique(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError('duplicate')
+                result[key] = value
+            return result
+        value = json.loads(raw, object_pairs_hook=unique)
+        if not isinstance(value, dict) or type(value.get('version')) is not int or value['version'] != 1:
+            raise ValueError('version')
+        status = value.get('status')
+        if status in FAILURES:
+            expected = 3 if status == 'unknown' else 2
+            return failure(status) if value == failure(status) and code == expected else failure('unknown')
+        if status != 'disclosed' or code != 0 or set(value) != {'version', 'status', 'device'}:
+            raise ValueError('status')
+        device = value['device']
+        if not isinstance(device, dict) or set(device) != set(fields.split(',')) or device.get('name') != name:
+            raise ValueError('selection')
+        if 'tags' in device:
+            tags = device['tags']
+            if not isinstance(tags, list) or len(tags) > 64 or len(set(tags)) != len(tags):
+                raise ValueError('tags')
+            if not all(isinstance(t, str) and re.fullmatch(r'tag:[a-z0-9-]{1,96}', t) for t in tags):
+                raise ValueError('tags')
+        if 'ips' in device:
+            ips = device['ips']
+            if not isinstance(ips, list) or not 1 <= len(ips) <= 8 or len(set(ips)) != len(ips):
+                raise ValueError('ips')
+            parsed = []
+            for text in ips:
+                if not isinstance(text, str) or '%' in text or len(text) > 45:
+                    raise ValueError('ip')
+                address = ipaddress.ip_address(text)
+                if address not in ipaddress.ip_network('100.' + '64.0.0/10') and address not in ipaddress.ip_network('fd7a:' + '115c:a1e0::/48'):
+                    raise ValueError('ip')
+                parsed.append(address)
+            if len(set(parsed)) != len(parsed):
+                raise ValueError('ip')
+        return value
+    except (ValueError, TypeError, UnicodeError, KeyError, RecursionError):
+        return failure('unknown')
+
+
+def wait_once(child, caller_pid, adapter, name, fields):
+    output = bytearray()
+    deadline = time.monotonic() + 360
+    with selectors.DefaultSelector() as selector:
+        selector.register(child.stdout, selectors.EVENT_READ)
+        while True:
+            if time.monotonic() >= deadline or os.getppid() != caller_pid or caller_pid <= 1:
+                adapter.stop(child)
+                return failure('unknown')
+            for key, _ in selector.select(timeout=0.25):
+                part = os.read(key.fd, 1024)
+                if not part:
+                    try:
+                        code = child.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        adapter.stop(child)
+                        return failure('unknown')
+                    return parse_result(bytes(output), code, name, fields)
+                output.extend(part)
+                if len(output) > MAX_RESULT:
+                    adapter.stop(child)
+                    return failure('unknown')
+
+
+def main():
+    try:
+        name, fields, frame = query(sys.argv[1:])
+    except ValueError:
+        return failure()
+    lock, child = None, None
+    adapter = None
+    caller_pid = os.getppid()
+    try:
+        adapter = common()
+        lock = adapter.acquire_lock()
+        adapter.verify_installation()
+        if caller_pid <= 1 or os.getppid() != caller_pid:
+            return failure()
+        child = subprocess.Popen([adapter.EXECUTABLE, '--lookup-and-wait'], stdin=subprocess.PIPE,
+                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                 env=adapter.safe_environment(), cwd='/', bufsize=0,
+                                 close_fds=True, start_new_session=True)
+        # Frame is at most 104 ASCII bytes, never an inventory or caller path.
+        child.stdin.write(frame)
+        child.stdin.close()
+        return wait_once(child, caller_pid, adapter, name, fields)
+    except (Exception, KeyboardInterrupt):
+        if child is not None:
+            try:
+                adapter.stop(child)
+            except Exception:
+                pass
+            return failure('unknown')
+        return failure()
+    finally:
+        if lock is not None:
+            os.close(lock)
+
+
+def interrupted(_signum, _frame):
+    raise InterruptedError('interrupted')
+
+
+if __name__ == '__main__':
+    signal.signal(signal.SIGTERM, interrupted)
+    result = main()
+    raw = (json.dumps(result, separators=(',', ':')) + '\n').encode('ascii')
+    try:
+        os.write(sys.stdout.fileno(), raw)
+    except OSError:
+        pass
+    sys.exit(0 if result['status'] == 'disclosed' else 3 if result['status'] == 'unknown' else 2)

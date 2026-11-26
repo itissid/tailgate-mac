@@ -49,6 +49,8 @@ Once a trusted release is installed and provisioned, the **agent** runs:
 Scripts/tailgate-submit --wait < Examples/browser.tailgate
 ```
 
+If the conversation names a machine but doesn't include its selectors, the agent can run `Scripts/tailgate-lookup --name demo-runner --fields name,tags`. You see the exact response and approve its release with Touch ID; request `name,tags,ips` only if the agent also needs overlay addresses. An approved result goes to the requesting agent/session and may reach its model provider. No inventory dump, fuzzy match or policy write is available from lookup. The compiler accepts tag selectors, not raw IP grants. See the [device lookup contract](Docs/device-lookup.md).
+
 See the [submission and receipt contract](Docs/submit-and-wait.md). A missing or `unknown` receipt is **not permission to retry**.
 
 The **agent's words aren't policy**. Tailgate displays them as unverified context and signs the context together with the compiled operation. Never put a transcript, password, token, real device inventory, or personal information in the file. Start with [`Examples/browser.tailgate`](Examples/browser.tailgate) or the [agent handoff format](Docs/agent-handoff.md). No agent socket, chat integration, clipboard watcher, automatic file opener, or shell executor is required.

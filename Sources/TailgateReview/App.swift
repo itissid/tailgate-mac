@@ -99,18 +99,20 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.regular); NSApp.activate(ignoringOtherApps: true)
     }
     func applicationWillTerminate(_ notification: Notification) {
-        if SubmissionRuntime.isSubmission { SubmissionRuntime.close() }
+        if LookupRuntime.isLookup { LookupRuntime.close() }
+        else if SubmissionRuntime.isSubmission { SubmissionRuntime.close() }
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 }
 @main struct TailgateApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     var body: some Scene {
-        Window(SubmissionRuntime.isSubmission ? "Tailgate — agent request" : "Tailgate — offline review", id: "review") {
-            if SubmissionRuntime.isSubmission { SubmissionWindow() } else { Workbench() }
+        Window(LookupRuntime.isLookup ? "Tailgate — device lookup" : (SubmissionRuntime.isSubmission ? "Tailgate — agent request" : "Tailgate — offline review"), id: "review") {
+            if LookupRuntime.isLookup { LookupWindow() }
+            else if SubmissionRuntime.isSubmission { SubmissionWindow() } else { Workbench() }
         }
         Window("Tailgate — live policy review", id: "live-review") {
-            if SubmissionRuntime.isSubmission { Text("Setup and other reviews are unavailable in this submission session.") } else { LiveWorkbench() }
+            if LookupRuntime.isLookup || SubmissionRuntime.isSubmission { Text("Setup and other reviews are unavailable in an agent request session.") } else { LiveWorkbench() }
         }
     }
 }
