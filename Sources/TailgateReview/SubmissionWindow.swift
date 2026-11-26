@@ -31,6 +31,9 @@ private enum SubmissionReadError: Error { case invalid }
 private func receiveSubmission() throws -> (Data, AgentHandoff) {
     // A direct caller that leaves stdin open cannot stall the UI or worker forever.
     let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+    let flags = fcntl(STDIN_FILENO, F_GETFL)
+    guard flags >= 0, fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK) == 0 else { throw SubmissionReadError.invalid }
+    defer { _ = fcntl(STDIN_FILENO, F_SETFL, flags) }
     var input = SubmissionInput()
     while ContinuousClock.now < deadline {
         var descriptor = pollfd(fd: STDIN_FILENO, events: Int16(POLLIN | POLLHUP), revents: 0)
@@ -41,7 +44,10 @@ private func receiveSubmission() throws -> (Data, AgentHandoff) {
         var chunk = [UInt8](repeating: 0, count: 4096)
         let count = Darwin.read(STDIN_FILENO, &chunk, chunk.count)
         if count == 0 { let frame = try input.finish(); return (frame.bytes, frame.handoff) }
-        guard count > 0 else { if errno == EINTR { continue }; throw SubmissionReadError.invalid }
+        guard count > 0 else {
+            if errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK { continue }
+            throw SubmissionReadError.invalid
+        }
         try input.append(Data(chunk.prefix(count)))
     }
     throw SubmissionReadError.invalid
