@@ -6,6 +6,8 @@ An agent can call Tailgate and wait: it submits a bounded `.tailgate` proposal o
 
 **Release status:** buildable source with an offline demo and a guarded live policy/browser-enrollment path. No pre-signed binary is distributed here. A regular `swift run` build cannot access the live credential store. Live deployment requires a Developer ID–signed, provisioned installation and human acceptance checks. **Live auth-key minting is disabled**, not silently substituted for browser enrollment.
 
+**Engineering guide:** [Who authorizes a Tailgate write?](Docs/trust-atlas.html) is a standalone HTML guide with UML deployment, object and sequence diagrams, plus a credential custody register. Open the downloaded file in a browser; no server or external scripts are required.
+
 ## Try it without an account
 
 Requires macOS 13+ and Swift 6.1+ (Apple Command Line Tools work; the full Xcode app is not needed to build or test). No external Swift package dependencies.
