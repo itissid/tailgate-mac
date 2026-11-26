@@ -99,7 +99,7 @@ private func readTrialInput() throws -> Data {
             do {
                 self.session = try TrialSession(handoff: result.get())
                 self.busy = false
-                self.note = "Inspect the fixed synthetic policy. Approve requests fresh Touch ID; nothing will be written. Approval expires in 120 seconds."
+                self.note = "Valid for 2 minutes. Closing this window declines the request."
             } catch { self.finish(TrialReceipt(.error)) }
         }
     }
@@ -124,29 +124,32 @@ private func readTrialInput() throws -> Data {
 @MainActor private struct TrialWindow: View {
     @ObservedObject private var model = TrialRuntime.model
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Tailgate / Agent fixture rehearsal").font(.title2.bold())
-            Text("DRY RUN ONLY — no network, credentials, enrollment or real policy writes.").fontWeight(.semibold)
-            Text("This development build demonstrates the interaction. Touch ID does not sign this plan or establish production app trust.").font(.callout).foregroundStyle(.secondary)
-            Divider()
-            if let plan = model.session?.plan {
-                GroupBox("UNTRUSTED AGENT PURPOSE — not authorization") {
-                    Text(verbatim: plan.purpose).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("Review access request").font(.system(size: 25, weight: .semibold))
+                    Text("Preview only. No network access or policy changes.").foregroundStyle(.secondary)
                 }
-                Text("Immutable review SHA-256: \(plan.fingerprint)").font(.system(.caption, design: .monospaced)).textSelection(.enabled)
-                ScrollView {
-                    Text(verbatim: plan.text).font(.system(.body, design: .monospaced)).textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }.background(Color(nsColor: .textBackgroundColor))
-            } else { Spacer(); ProgressView("Receiving one fixture proposal…"); Spacer() }
-            Text(verbatim: model.note).font(.callout).foregroundStyle(.secondary)
-            HStack {
-                Button("Decline and return to agent") { model.close() }.keyboardShortcut(.cancelAction)
                 Spacer()
-                Button("Approve FIXTURE ONLY with Touch ID…") { model.approve() }.disabled(model.busy)
-            }
-            Text("One attempt. Closing or Command-Q declines. A missing receipt never means success.").font(.caption).foregroundStyle(.secondary)
-        }.padding(20).frame(minWidth: 700, minHeight: 560)
+                Label("Dry run", systemImage: "flask").font(.callout.weight(.semibold)).padding(.vertical, 5).padding(.horizontal, 9)
+                    .background(Color.blue.opacity(0.15), in: Capsule())
+            }.padding(20)
+            Divider()
+            ScrollView {
+                if let plan = model.session?.plan { TrialReviewCard(plan: plan).padding(20) }
+                else { ProgressView("Receiving proposal…").padding(24) }
+            }.frame(maxWidth: .infinity, maxHeight: .infinity)
+            Divider()
+            VStack(alignment: .leading, spacing: 10) {
+                Text(verbatim: model.note).font(.callout).foregroundStyle(.secondary)
+                HStack {
+                    Button("Decline") { model.close() }.keyboardShortcut(.cancelAction)
+                    Spacer()
+                    Button { model.approve() } label: { Label("Approve dry run with Touch ID…", systemImage: "touchid") }
+                        .buttonStyle(.borderedProminent).disabled(model.busy)
+                }.controlSize(.large)
+            }.padding(.horizontal, 20).padding(.vertical, 12)
+        }.frame(minWidth: 620, idealWidth: 690, minHeight: 480, idealHeight: 505)
         .task { model.start() }
         .onDisappear { model.close() }
     }
@@ -165,5 +168,5 @@ private func readTrialInput() throws -> Data {
 
 @main struct TailgateTrialApp: App {
     @NSApplicationDelegateAdaptor(TrialDelegate.self) private var delegate
-    var body: some Scene { Window("Tailgate — FIXTURE ONLY", id: "trial") { TrialWindow() } }
+    var body: some Scene { Window("Tailgate — Dry run", id: "trial") { TrialWindow() }.defaultSize(width: 690, height: 505) }
 }

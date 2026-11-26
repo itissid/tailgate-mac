@@ -3,11 +3,38 @@ import Foundation
 
 public enum TrialFailure: Error { case invalidInput, invalidState }
 
+/// Presentation reads the compiled policy, never the agent's reason for asking.
+public struct TrialAccessSummary: Sendable {
+    public let source, destination, transport: String
+    public let allowed, denied: [UInt16]
+    fileprivate init(body: Data) throws {
+        struct Policy: Decodable {
+            struct Grant: Decodable { let src, dst, ip: [String] }
+            struct Check: Decodable { let src, proto: String; let accept, deny: [String] }
+            let grants: [Grant]; let tests: [Check]
+        }
+        let p = try JSONDecoder().decode(Policy.self, from: body)
+        guard p.grants.count == 1, p.tests.count == 1, let g = p.grants.first, let t = p.tests.first,
+              g.src == [t.src], g.dst.count == 1, let dest = g.dst.first else { throw TrialFailure.invalidInput }
+        func ports(_ entries: [String], prefix: String) throws -> [UInt16] {
+            try entries.map { entry in
+                guard entry.hasPrefix(prefix), let port = UInt16(entry.dropFirst(prefix.count)) else { throw TrialFailure.invalidInput }
+                return port
+            }.sorted()
+        }
+        source = t.src; destination = dest; transport = t.proto.uppercased()
+        allowed = try ports(t.accept, prefix: dest + ":"); denied = try ports(t.deny, prefix: dest + ":")
+        guard try ports(g.ip, prefix: t.proto + ":") == allowed else { throw TrialFailure.invalidInput }
+    }
+}
+
 /// Fixed synthetic operation only. This does not confer production authority.
 public struct TrialPlan: Sendable {
     public let id: UUID
     public let purpose: String
     public let body: Data
+    public let access: TrialAccessSummary
+    public let formattedPolicy: String
     public let text: String
     public let fingerprint: String
     public static let example = Data(("TAILGATE/1\nAllow the demo client to reach the demo API on TCP 443.\n\n" + String(decoding: Compiler.example, as: UTF8.self) + "\n").utf8)
@@ -18,6 +45,9 @@ public struct TrialPlan: Sendable {
         let fixture = try Compiler.compile(proposal: Compiler.example, base: Compiler.fixturePolicy)
         guard compiled.candidate == fixture.candidate, compiled.mode == "browser", compiled.vm == "demo-vm", compiled.tag == fixture.tag else { throw TrialFailure.invalidInput }
         id = UUID(); purpose = handoff.purpose; body = compiled.candidate
+        access = try TrialAccessSummary(body: body)
+        let json = try JSONSerialization.jsonObject(with: body)
+        formattedPolicy = String(decoding: try JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]), as: UTF8.self)
         text = """
         TAILGATE / FIXTURE REHEARSAL / NO REAL WRITE
         Trial ID: \(id.uuidString)

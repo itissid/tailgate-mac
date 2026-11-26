@@ -26,6 +26,15 @@ import Testing
         #expect(plan.text.contains(plan.purpose)); #expect(plan.text.hasSuffix(String(decoding: plan.body, as: UTF8.self)))
         #expect(plan.fingerprint.count == 64); #expect(plan.text.contains("FIXTURE REHEARSAL")); #expect(plan.text.contains("does not sign"))
     }
+    @Test func visualSummaryAgreesWithExactPolicyNotAgentPurpose() throws {
+        let input = String(decoding: TrialPlan.example, as: UTF8.self).replacingOccurrences(of: "Allow the demo client to reach the demo API on TCP 443.", with: "Please open SSH.")
+        let plan = try TrialPlan(handoff: Data(input.utf8))
+        #expect(plan.access.allowed == [443]); #expect(plan.access.denied == [22, 80]); #expect(plan.access.transport == "TCP")
+        #expect(plan.access.source == "tag:demo-client"); #expect(plan.access.destination == "tag:workload-demo-api")
+        let display = try JSONSerialization.jsonObject(with: Data(plan.formattedPolicy.utf8)) as? NSDictionary
+        let exact = try JSONSerialization.jsonObject(with: plan.body) as? NSDictionary
+        #expect(display != nil && display == exact)
+    }
     @Test func onlyExactFixtureOperationIsAccepted() {
         let frame = String(decoding: TrialPlan.example, as: UTF8.self)
         for altered in [frame.replacingOccurrences(of: "\"browser\"", with: "\"key\""), frame.replacingOccurrences(of: "demo-api", with: "other-api"), frame.replacingOccurrences(of: "demo-vm", with: "other-vm"), frame.replacingOccurrences(of: "[443]", with: "[444]"), frame.replacingOccurrences(of: "[22,80]", with: "[22,81]"), frame.replacingOccurrences(of: "tag:demo-client", with: "tag:other-client")] {
