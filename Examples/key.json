@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "tag": "tag:workload-demo-api",
+  "mode": "key",
+  "vm": "demo-vm",
+  "grants": [
+    {"src":"tag:demo-client","dst":"tag:workload-demo-api","protocol":"tcp","ports":[443]}
+  ],
+  "tests": [
+    {"src":"tag:demo-client","dst":"tag:workload-demo-api","protocol":"tcp","allow":[443],"deny":[22,80]}
+  ]
+}
