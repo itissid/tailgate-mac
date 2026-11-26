@@ -39,8 +39,8 @@ public enum MacTrustError: String, Error, LocalizedError {
     /// Provision non-journal configuration from the signed app's UI only. Values remain
     /// local, device-only, and inaccessible to a caller lacking this access group.
     public func store(slot: String, value: Data) throws {
-        guard ["configuration", "receipt"].contains(slot), !value.isEmpty, value.count <= 65_536 else { throw MacTrustError.invalidInput }
-        if slot == "configuration" {
+        guard ["configuration", "lookup-reader", "receipt"].contains(slot), !value.isEmpty, value.count <= 65_536 else { throw MacTrustError.invalidInput }
+        if slot != "receipt" {
             do { try add(slot: slot, data: value) } // immutable configuration prevents cross-process substitution
             catch MacTrustError.replay { throw MacTrustError.alreadyProvisioned }
             return
@@ -52,7 +52,7 @@ public enum MacTrustError: String, Error, LocalizedError {
     }
 
     public func load(slot: String) throws -> Data {
-        guard ["configuration", "receipt"].contains(slot) else { throw MacTrustError.invalidInput }
+        guard ["configuration", "lookup-reader", "receipt"].contains(slot) else { throw MacTrustError.invalidInput }
         return try read(slot: slot)
     }
 

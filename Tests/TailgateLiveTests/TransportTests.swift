@@ -170,6 +170,26 @@ struct TransportTests {
             await #expect(throws:TailnetAPIError.invalidResponse) { try await api.devices(using:credential) }
         }
     }
+    @Test func lookupInventoryUsesOnlyReaderScopeAndFixedInventoryEndpoint() async throws {
+        let key = String(repeating: "a", count: 64), overlay = ["100", "100", "1", "2"].joined(separator: ".")
+        let row = #"{"id":"demo-id","nodeKey":"\#(key)","authorized":true,"tags":["tag:api"],"hostname":"api","addresses":["\#(overlay)"]}"#
+        let wire = ScriptedWire([token, reply("{\"devices\":[\(row)]}")])
+        let devices = try await TailnetAPI(tailnet: "example.com", transport: wire).lookupInventory(using: credential)
+        #expect(devices.count == 1); #expect(devices[0].nodeKey == "nodekey:" + key); #expect(devices[0].addresses == [overlay])
+        let requests = await wire.requests
+        #expect(requests.count == 2); #expect(requests[1].httpMethod == "GET")
+        #expect(requests[1].url?.absoluteString == "https://api.tailscale.com/api/v2/tailnet/example.com/devices?fields=all")
+        let form = String(decoding: try #require(requests[0].httpBody), as: UTF8.self)
+        #expect(form.hasSuffix("scope=devices%3Acore%3Aread")); #expect(!form.contains("policy_file")); #expect(!form.contains("auth_keys"))
+        for headers in [["Link": "next"], ["content-range": "bytes 1-2/3"], ["x-next-page": "2"]] {
+            let api = try TailnetAPI(tailnet: "example.com", transport: ScriptedWire([token, reply("{\"devices\":[\(row)]}", headers: headers)]))
+            await #expect(throws: TailnetAPIError.invalidResponse) { try await api.lookupInventory(using: credential) }
+        }
+        for bad in ["{\"devices\":[\(row),\(row)]}", "{\"devices\":[],\"next\":\"page2\"}", "{\"devices\":[],\"devices\":[\(row)]}"] {
+            let api = try TailnetAPI(tailnet: "example.com", transport: ScriptedWire([token, reply(bad)]))
+            await #expect(throws: TailnetAPIError.invalidResponse) { try await api.lookupInventory(using: credential) }
+        }
+    }
     @Test func oversizedResponsesFailClosed() async throws {
         let response = HTTPResult(status:200,headers:policyHeaders,body:Data(repeating:123,count:TailnetAPI.maxResponse + 1))
         let api = try TailnetAPI(tailnet:"example.com",transport:ScriptedWire([token,.success(response)]))

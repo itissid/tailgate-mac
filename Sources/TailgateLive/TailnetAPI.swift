@@ -102,12 +102,36 @@ public struct TailnetAPI: Sendable {
         do { return try snapshot(response) }
         catch { throw TailnetAPIError.outcomeUnknown }
     }
-    public func devices(using credential: OAuthCredential) async throws -> [TailnetDevice] {
+    private func inventoryRows(using credential: OAuthCredential) async throws -> [[String: Any]] {
         let response = try await authorized(method: "GET", suffix: "devices?fields=all", body: nil, credential: credential, inventory: true)
         try checkReadStatus(response.status)
         guard !response.headers.keys.contains(where: Self.continuationHeader) else { throw TailnetAPIError.invalidResponse }
         guard let root = try? Self.object(response.body),
               Set(root.keys) == ["devices"], let rows = root["devices"] as? [[String: Any]], rows.count <= 10_000 else { throw TailnetAPIError.invalidResponse }
+        return rows
+    }
+    /// Private read-only inventory for the operator-gated point disclosure. Never
+    /// exposes this whole inventory to a caller or requests a writer OAuth scope.
+    func lookupInventory(using credential: OAuthCredential) async throws -> [LookupDevice] {
+        let rows = try await inventoryRows(using: credential)
+        var result = [LookupDevice](), ids = Set<String>(), keys = Set<String>()
+        for row in rows {
+            let tagValue: Any = row["tags"] ?? [String]()
+            guard let id = row["id"] as? String, Self.asciiID(id),
+                  let rawKey = row["nodeKey"] as? String, let key = Self.normalizedNodeKey(rawKey),
+                  let auth = row["authorized"] as? NSNumber, CFGetTypeID(auth) == CFBooleanGetTypeID(),
+                  let hostname = row["hostname"] as? String, Self.safeText(hostname),
+                  let tags = tagValue as? [String], tags.count <= 64, Set(tags).count == tags.count, tags.allSatisfy(Self.tag),
+                  ids.insert(id).inserted, keys.insert(key).inserted else { throw TailnetAPIError.invalidResponse }
+            let addresses = row["addresses"] as? [String]
+            // Missing or malformed addresses cannot be disclosed when requested.
+            // Do not fail a name-only lookup because an unselected device has no IP.
+            result.append(LookupDevice(id: id, nodeKey: key, hostname: hostname, authorized: auth.boolValue, tags: tags, addresses: addresses))
+        }
+        return result
+    }
+    public func devices(using credential: OAuthCredential) async throws -> [TailnetDevice] {
+        let rows = try await inventoryRows(using: credential)
         var result = [TailnetDevice](), ids = Set<String>(), nodes = Set<String>(), keys = Set<String>()
         for row in rows {
             // Official device fixtures omit `tags` for user-owned/untagged nodes.
