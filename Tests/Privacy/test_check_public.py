@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parents[2] / "Scripts" / "check-public.py"
 spec = importlib.util.spec_from_file_location("check_public", SCRIPT)
@@ -104,6 +105,25 @@ class ContentTests(unittest.TestCase):
         self.assertNotIn(fake_private_email(), label)
 
 
+class HostnameTests(unittest.TestCase):
+    def test_discovery_uses_only_local_sources_without_any_resolver(self):
+        completed = subprocess.CompletedProcess([], 0, stdout=b"fixture-machine.local\n", stderr=b"")
+        with mock.patch.object(privacy.socket, "gethostname", return_value="fixture-kernel-host"), \
+             mock.patch.object(privacy.socket, "getfqdn", side_effect=AssertionError("Resolver forbidden")), \
+             mock.patch.object(privacy.socket, "gethostbyname", side_effect=AssertionError("Resolver forbidden")), \
+             mock.patch.object(privacy.socket, "gethostbyaddr", side_effect=AssertionError("Resolver forbidden")), \
+             mock.patch.object(privacy.socket, "getaddrinfo", side_effect=AssertionError("Resolver forbidden")), \
+             mock.patch.object(privacy.sys, "platform", "darwin"), \
+             mock.patch.object(privacy.subprocess, "run", return_value=completed) as local_query:
+            names = privacy.local_hostnames()
+        self.assertIn("fixture-kernel-host", names)
+        self.assertIn("fixture-machine.local", names)
+        self.assertIn("fixture-machine", names)
+        self.assertEqual(local_query.call_count, 3)
+        for call in local_query.call_args_list:
+            self.assertEqual(call.args[0][:2], ["/usr/sbin/scutil", "--get"])
+
+
 class GitTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="publication-privacy-")
@@ -132,6 +152,10 @@ class GitTests(unittest.TestCase):
 
     def scanner(self):
         return privacy.Scanner(self.repo, hosts=set())
+
+    def test_worktree_does_not_reopen_a_prechecked_path_to_read(self):
+        with mock.patch.object(Path, "read_bytes", side_effect=AssertionError("Path-based read forbidden")):
+            self.scanner().worktree()
 
     def test_clean_history_index_and_worktree(self):
         scanner = self.scanner()

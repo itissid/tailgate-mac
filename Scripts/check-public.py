@@ -15,6 +15,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import socket
+import stat
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -76,8 +77,8 @@ def git(repo: Path, *args: str, limit: int = MAX_COMMAND) -> bytes:
 
 
 def local_hostnames() -> set[str]:
-    """Use runtime observations, never commit a user's hostname as a search needle."""
-    names = {socket.gethostname(), socket.getfqdn()}
+    """Read kernel/configured names only; never invoke a DNS/mDNS resolver."""
+    names = {socket.gethostname()}
     if sys.platform == "darwin":
         for key in ("ComputerName", "LocalHostName", "HostName"):
             try:
@@ -177,6 +178,59 @@ def path_label(path: str, hosts: set[str]) -> str:
     if path_categories(path, hosts) or not re.fullmatch(r"[A-Za-z0-9_./-]{1,180}", path):
         return "path-sha256:" + hashlib.sha256(path.encode("utf-8", "surrogateescape")).hexdigest()[:16]
     return path
+
+
+def read_worktree_file(root_fd: int, path: str, limit: int) -> bytes | None:
+    """Read a bounded, stable regular file through the descriptor we validate.
+
+    Every component is opened relative to an already-open directory, without
+    following symlinks. NONBLOCK prevents FIFO substitution from hanging open;
+    fstat rejects every nonregular final object before any read. Missing paths
+    are deletions, already covered by the staged index/history.
+    """
+    parts = path.split("/")
+    if limit < 0 or any(part in {"", ".", ".."} for part in parts) or "\0" in path:
+        raise ScanFailure("invalid-worktree-path-or-budget")
+    if not all(hasattr(os, flag) for flag in ("O_NOFOLLOW", "O_DIRECTORY", "O_NONBLOCK", "O_CLOEXEC")):
+        raise ScanFailure("safe-worktree-open-unavailable")
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    fd = None
+    directory = os.dup(root_fd)
+    try:
+        try:
+            for part in parts[:-1]:
+                child = os.open(part, directory_flags, dir_fd=directory)
+                os.close(directory)
+                directory = child
+            fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                         dir_fd=directory)
+        except FileNotFoundError:
+            return None
+        except OSError:
+            raise ScanFailure("unsafe-worktree-open") from None
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise ScanFailure("nonregular-worktree-file")
+        if before.st_size < 0 or before.st_size > min(limit, MAX_BLOB):
+            raise ScanFailure("worktree-size-limit")
+        # Read at most the observed size plus one sentinel byte: a growing file
+        # cannot make this loop allocate an unbounded buffer or wait for EOF.
+        ceiling = before.st_size + 1
+        data = bytearray()
+        while len(data) < ceiling:
+            chunk = os.read(fd, min(65_536, ceiling - len(data)))
+            if not chunk:
+                break
+            data.extend(chunk)
+        after = os.fstat(fd)
+        version = lambda s: (s.st_dev, s.st_ino, s.st_mode, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+        if len(data) != before.st_size or version(before) != version(after):
+            raise ScanFailure("worktree-file-changed")
+        return bytes(data)
+    finally:
+        if fd is not None:
+            os.close(fd)
+        os.close(directory)
 
 
 @dataclass(frozen=True, order=True)
@@ -292,27 +346,22 @@ class Scanner:
     def worktree(self) -> None:
         root = self.repo.resolve()
         paths = git(self.repo, "ls-files", "--cached", "--others", "--exclude-standard", "-z").split(b"\0")
-        for raw_path in set(paths) - {b""}:
-            path = raw_path.decode("utf-8", "surrogateescape")
-            absolute = root / path
-            if not absolute.exists() and not absolute.is_symlink():
-                continue  # Deleted files remain covered by history/index.
-            label = path_label(path, self.hosts)
-            for category in path_categories(path, self.hosts):
-                self.findings.add(Finding("worktree", label, category))
-            if absolute.is_symlink() or not absolute.is_file():
-                self.findings.add(Finding("worktree", label, "nonregular-file-not-scanned"))
-                continue
-            if not absolute.resolve().is_relative_to(root):
-                raise ScanFailure("worktree-outside-root")
-            size = absolute.stat().st_size
-            if size > MAX_BLOB or self.total + size > MAX_TOTAL:
-                raise ScanFailure("worktree-size-limit")
-            data = absolute.read_bytes()
-            self.total += len(data)
-            if not is_text(data):
-                self.findings.add(Finding("worktree", label, "binary-not-reviewed"))
-            self.inspect(reviewed_fixture_bytes(path, data), "worktree", label)
+        root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            for raw_path in set(paths) - {b""}:
+                path = raw_path.decode("utf-8", "surrogateescape")
+                label = path_label(path, self.hosts)
+                for category in path_categories(path, self.hosts):
+                    self.findings.add(Finding("worktree", label, category))
+                data = read_worktree_file(root_fd, path, min(MAX_BLOB, MAX_TOTAL - self.total))
+                if data is None:
+                    continue
+                self.total += len(data)
+                if not is_text(data):
+                    self.findings.add(Finding("worktree", label, "binary-not-reviewed"))
+                self.inspect(reviewed_fixture_bytes(path, data), "worktree", label)
+        finally:
+            os.close(root_fd)
 
 
 def main(argv: list[str] | None = None) -> int:
