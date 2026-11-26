@@ -8,6 +8,11 @@ import Testing
     func approve(_ plan: TrialPlan) async -> Bool { action(plan) }
 }
 
+@MainActor private final class WaitingFixtureGate: TrialGate {
+    var continuation: CheckedContinuation<Bool, Never>?
+    func approve(_ plan: TrialPlan) async -> Bool { await withCheckedContinuation { continuation = $0 } }
+}
+
 @MainActor struct TrialTests {
     @Test func checkedInExampleMatchesEmbeddedBytes() throws {
         let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
@@ -49,6 +54,15 @@ import Testing
         #expect(result.status == .approved); #expect(calls == 1)
         await #expect(throws: TrialFailure.invalidState) { try await s.approve(gate: FixtureGate()) }
         #expect(s.cancel().status == .approved) // terminal result cannot change
+    }
+    @Test func concurrentAttemptIsDeniedBeforeSecondPrompt() async throws {
+        let s = try TrialSession(handoff: TrialPlan.example), gate = WaitingFixtureGate()
+        let first = Task { try await s.approve(gate: gate) }
+        for _ in 0..<100 { if gate.continuation != nil { break }; await Task.yield() }
+        let waiting = try #require(gate.continuation)
+        await #expect(throws: TrialFailure.invalidState) { try await s.approve(gate: FixtureGate()) }
+        _ = s.cancel(); waiting.resume(returning: true)
+        #expect(try await first.value.status == .declined)
     }
     @Test func refusalConsumesAttempt() async throws {
         let s = try TrialSession(handoff: TrialPlan.example)
