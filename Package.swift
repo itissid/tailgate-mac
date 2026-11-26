@@ -9,8 +9,10 @@ let package = Package(
     ],
     targets: [
         .target(name: "TailgateCore"),
-        .executableTarget(name: "TailgateReview", dependencies: ["TailgateCore"]),
+        .target(name: "TailgateLive", dependencies: ["TailgateCore"]),
+        .executableTarget(name: "TailgateReview", dependencies: ["TailgateCore", "TailgateLive"]),
         .executableTarget(name: "TailgatePreview", dependencies: ["TailgateCore"]),
-        .testTarget(name: "TailgateCoreTests", dependencies: ["TailgateCore"])
+        .testTarget(name: "TailgateCoreTests", dependencies: ["TailgateCore"]),
+        .testTarget(name: "TailgateLiveTests", dependencies: ["TailgateLive", "TailgateCore"])
     ]
 )
