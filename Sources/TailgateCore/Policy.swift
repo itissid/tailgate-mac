@@ -106,12 +106,24 @@ public enum Compiler {
         return CompiledPolicy(candidate: candidate, tag: tag, mode: mode, vm: vm)
     }
 
+    /// Pure onboarding validation. Uses exactly the grammar enforced during live compilation.
+    public static func validSource(_ s: String) -> Bool { validExistingTag(s) }
+    public static func validVM(_ s: String) -> Bool { validName(s, max: 64) }
+
+    /// Validate the entire proposal before any authenticated read, without policy or inventory.
+    /// A successful result establishes only shape, local-pin matches, and explicit mode;
+    /// compileLive must still check the independently fetched policy and occupied inventory.
+    public static func preflightLive(proposal: Data, vm: String, source: String) throws -> String {
+        guard validVM(vm), validSource(source) else { throw PolicyError.invalidProposal }
+        return try compileProposal(proposal, vm: vm, source: source).mode
+    }
+
     /// Live requests are append-only within a deliberately small, closed-world subset.
     /// `vm`, `source`, and occupied inventory tags must come from trusted local configuration,
     /// never from the proposal. This method does not fetch inventory or run server validation.
     public static func compileLive(proposal: Data, base: Data, vm: String, source: String,
                                    occupiedTags: Set<String>) throws -> CompiledPolicy {
-        guard validName(vm, max: 64), validExistingTag(source), occupiedTags.count <= 4_096,
+        guard validVM(vm), validSource(source), occupiedTags.count <= 4_096,
               occupiedTags.allSatisfy(validExistingTag) else { throw PolicyError.invalidProposal }
         var parser = try StrictJSON(base)
         var existing = try validateLivePolicy(try parser.parse())

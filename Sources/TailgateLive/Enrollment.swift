@@ -57,6 +57,7 @@ public enum EnrollmentError: String, Error, Equatable, LocalizedError, Sendable 
     case identityChanged = "The pinned device ID now has a different node public key. Stop; do not select another device."
     case ambiguousIdentity = "More than one device matched the identity pin. Enrollment cannot be confirmed."
     case unexpectedTags = "The pinned node has tags other than the one approved tag. Enrollment cannot be confirmed."
+    case destinationTagConflict = "A non-pinned node also carries the reviewed destination tag. Access is broader than the intended VM; stop and reconcile without automatic cleanup."
     case expired = "Enrollment wait expired. No key or enrollment operation was attempted."
     case cancelled = "Enrollment wait cancelled. No cleanup write was attempted."
     case invalidObservation = "Enrollment inventory observation is invalid or unsupported."
@@ -180,6 +181,13 @@ public struct BrowserEnrollmentMonitor: Sendable {
             state = .stopped(.policyChanged); return state
         }
         guard snapshot.devices.count <= 10_000 else { state = .stopped(.invalidObservation); return state }
+        // A destination tag grants access to every holder, not just the pinned
+        // VM. Reject any other holder (including one with a missing key) before
+        // a waiting or success result. Stale evidence of a conflict is also a
+        // reason to stop and reconcile, never a reason to broaden access.
+        guard !snapshot.devices.contains(where: { $0.nodeKey != plan.binding.nodeKey && $0.tags.contains(plan.expectedTag) }) else {
+            state = .stopped(.destinationTagConflict); return state
+        }
         guard snapshot.observedAt.timeIntervalSince1970.isFinite, snapshot.observedAt >= plan.startedAt,
               snapshot.observedAt <= now, now.timeIntervalSince(snapshot.observedAt) <= 30 else {
             state = .waiting(.freshInventoryRequired); return state

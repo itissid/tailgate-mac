@@ -173,4 +173,44 @@ struct LiveCompilerTests {
         do { _ = try compile(Data("PRIVATE-SECRET-DO-NOT-ECHO".utf8)); Issue.record("Unexpected acceptance") }
         catch { #expect(!error.localizedDescription.contains("PRIVATE-SECRET")) }
     }
+    @Test func preflightReturnsOnlyExplicitValidatedModeWithoutPolicyOrInventory() throws {
+        #expect(try Compiler.preflightLive(proposal: proposal(), vm: vm, source: source) == "browser")
+        let key = try proposal { $0["mode"] = "key" }
+        #expect(try Compiler.preflightLive(proposal: key, vm: vm, source: source) == "key")
+        // Freshness belongs to compileLive, not this structural-only preflight.
+        #expect(try Compiler.preflightLive(proposal: key, vm: vm, source: source) == compile(key).mode)
+        rejected(key, occupied: [target])
+    }
+    @Test func preflightRejectsEveryMalformedShapeAndMismatchedLocalPin() throws {
+        var malformed: [Data] = [Data(), Data("{}".utf8), Data("//comment".utf8), Data(repeating: 32, count: 16_385)]
+        for key in ["mode", "version", "vm", "grants", "tests", "tag"] {
+            malformed.append(try proposal { $0.removeValue(forKey: key) })
+        }
+        malformed.append(try proposal { $0["vm"] = "other-vm" })
+        malformed.append(try proposal { $0["mode"] = "browser+key" })
+        malformed.append(try proposal { $0["extra"] = "private-secret" })
+        malformed.append(try proposal { $0["tag"] = "tag:prod" })
+        malformed.append(try proposal { root in
+            var tests = root["tests"] as! [[String: Any]]; tests[0]["allow"] = [22]; root["tests"] = tests
+        })
+        malformed.append(try proposal { root in
+            var grants = root["grants"] as! [[String: Any]]; grants[0]["src"] = "tag:other"; root["grants"] = grants
+        })
+        malformed.append(Data(String(decoding: try proposal(), as: UTF8.self).replacingOccurrences(of: "\"version\":1", with: "\"version\":1,\"version\":1").utf8))
+        for input in malformed {
+            #expect(throws: (any Error).self) { try Compiler.preflightLive(proposal: input, vm: vm, source: source) }
+        }
+    }
+    @Test func onboardingValidatorsMatchExactASCIIBoundsAndNeverAcceptControlText() throws {
+        for value in ["a", "a0", "vm-01", String(repeating: "a", count: 64)] { #expect(Compiler.validVM(value)) }
+        for value in ["", "A", "0vm", "-vm", "vm-", "vm_01", "vm.01", "vm ", "vm\n", "vm\u{202E}", "νm", String(repeating: "a", count: 65)] {
+            #expect(!Compiler.validVM(value))
+            #expect(throws: (any Error).self) { try Compiler.preflightLive(proposal: proposal(), vm: value, source: source) }
+        }
+        for value in ["tag:a", source, "tag:" + String(repeating: "a", count: 48)] { #expect(Compiler.validSource(value)) }
+        for value in ["", "a", "tag:", "tag:A", "tag:0a", "tag:a-", "tag:a_b", "tag:a:b", "tag:*", "tag:a\u{7F}", "tag:a\u{202E}", "tag:" + String(repeating: "a", count: 49)] {
+            #expect(!Compiler.validSource(value))
+            #expect(throws: (any Error).self) { try Compiler.preflightLive(proposal: proposal(), vm: vm, source: value) }
+        }
+    }
 }

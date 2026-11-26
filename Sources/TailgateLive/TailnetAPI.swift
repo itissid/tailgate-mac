@@ -29,7 +29,7 @@ public struct TailnetDevice: Sendable, Equatable {
 
 public enum TailnetAPIError: Error, Equatable, LocalizedError {
     case invalidConfiguration, invalidInput, credentialRejected, unavailable, invalidResponse
-    case validationFailed, stalePolicy, rejected(Int), outcomeUnknown
+    case validationFailed, stalePolicy, rejected(Int), outcomeUnknown, notDispatched
     public var errorDescription: String? {
         switch self {
         case .invalidConfiguration: return "Use an explicit tailnet identifier, not an alias or URL."
@@ -41,6 +41,7 @@ public enum TailnetAPIError: Error, Equatable, LocalizedError {
         case .stalePolicy: return "The policy changed. Re-fetch and review; do not retry this approval."
         case .rejected(let status): return "Tailscale rejected the request (HTTP \(status))."
         case .outcomeUnknown: return "Policy write outcome unknown. Reconcile with a read; never automatically repeat the write."
+        case .notDispatched: return "The final approval guard failed. The policy POST was not dispatched."
         }
     }
 }
@@ -82,12 +83,18 @@ public struct TailnetAPI: Sendable {
               obj["message"] == nil || (obj["message"] as? String) == "",
               obj["data"] == nil || (obj["data"] as? [Any])?.isEmpty == true else { throw TailnetAPIError.validationFailed }
     }
-    public func apply(_ candidate: Data, ifMatch etag: String, using credential: OAuthCredential) async throws -> PolicySnapshot {
+    public func apply(_ candidate: Data, ifMatch etag: String, using credential: OAuthCredential, beforeDispatch: @escaping @MainActor () throws -> Void) async throws -> PolicySnapshot {
         try checkCandidate(candidate)
         guard Self.isStrongETag(etag) else { throw TailnetAPIError.invalidInput }
+        let token = try await accessToken(credential, scope: "policy_file devices:core:read devices:posture_attributes")
+        let request = makeRequest(method: "POST", suffix: "acl", body: candidate, etag: etag, token: token)
         let response: HTTPResult
-        do { response = try await authorized(method: "POST", suffix: "acl", body: candidate, etag: etag, credential: credential, write: true) }
-        catch let error as TailnetAPIError { throw error }
+        do {
+            // The production transport runs the final guard on MainActor immediately
+            // before URLSessionDataTask.resume(), after all token acquisition/hops.
+            response = try await transport.sendWrite(request, limit: Self.maxResponse, beforeDispatch: beforeDispatch)
+            guard response.body.count <= Self.maxResponse else { throw TailnetAPIError.outcomeUnknown }
+        } catch TailnetAPIError.notDispatched { throw TailnetAPIError.notDispatched }
         catch { throw TailnetAPIError.outcomeUnknown }
         if response.status == 412 { throw TailnetAPIError.stalePolicy }
         if [400,401,403,404,405,409,422].contains(response.status) { throw TailnetAPIError.rejected(response.status) }
@@ -98,6 +105,7 @@ public struct TailnetAPI: Sendable {
     public func devices(using credential: OAuthCredential) async throws -> [TailnetDevice] {
         let response = try await authorized(method: "GET", suffix: "devices?fields=all", body: nil, credential: credential, inventory: true)
         try checkReadStatus(response.status)
+        guard !response.headers.keys.contains(where: Self.continuationHeader) else { throw TailnetAPIError.invalidResponse }
         guard let root = try? Self.object(response.body),
               Set(root.keys) == ["devices"], let rows = root["devices"] as? [[String: Any]], rows.count <= 10_000 else { throw TailnetAPIError.invalidResponse }
         var result = [TailnetDevice](), ids = Set<String>(), nodes = Set<String>(), keys = Set<String>()
@@ -116,6 +124,11 @@ public struct TailnetAPI: Sendable {
             result.append(TailnetDevice(id: id, nodeID: nodeID, nodeKey: nodeKey, authorized: rawAuth.boolValue, tags: tags.sorted(), name: name, hostname: hostname))
         }
         return result
+    }
+    private static func continuationHeader(_ name: String) -> Bool {
+        let key = name.lowercased()
+        return ["link", "content-range", "x-next-page", "x-next-cursor", "x-continuation-token", "continuation-token", "next-page", "next-cursor", "x-total-count", "x-total-pages", "x-page", "x-page-size", "x-per-page"].contains(key)
+            || key.contains("pagination") || key.contains("continuation") || key.hasPrefix("x-next-")
     }
     private static func object(_ bytes: Data) throws -> [String:Any] {
         var scan = UniqueJSON(bytes: Array(bytes)); try scan.parse()
@@ -159,9 +172,17 @@ public struct TailnetAPI: Sendable {
             throw TailnetAPIError.rejected(status)
         }
     }
-    private func authorized(method: String, suffix: String, body: Data?, etag: String? = nil, credential: OAuthCredential, inventory: Bool = false, write: Bool = false) async throws -> HTTPResult {
-        let scope = inventory ? "devices:core:read" : (write ? "policy_file devices:core:read devices:posture_attributes" : "policy_file:read devices:core:read devices:posture_attributes:read")
+    private func authorized(method: String, suffix: String, body: Data?, credential: OAuthCredential, inventory: Bool = false) async throws -> HTTPResult {
+        let scope = inventory ? "devices:core:read" : "policy_file:read devices:core:read devices:posture_attributes:read"
         let token = try await accessToken(credential, scope: scope)
+        let request = makeRequest(method: method, suffix: suffix, body: body, token: token, inventory: inventory)
+        do {
+            let response = try await transport.send(request, limit: Self.maxResponse)
+            guard response.body.count <= Self.maxResponse else { throw TailnetAPIError.invalidResponse }
+            return response
+        } catch { throw TailnetAPIError.unavailable }
+    }
+    private func makeRequest(method: String, suffix: String, body: Data?, etag: String? = nil, token: String, inventory: Bool = false) -> URLRequest {
         let url = URL(string: Self.origin + "/api/v2/tailnet/" + tailnet + "/" + suffix)!
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData, timeoutInterval: 25)
         request.httpMethod = method; request.httpBody = body
@@ -169,11 +190,7 @@ public struct TailnetAPI: Sendable {
         request.setValue(inventory ? "application/json" : "application/hujson", forHTTPHeaderField: "Accept")
         if body != nil { request.setValue("application/hujson", forHTTPHeaderField: "Content-Type") }
         if let etag { request.setValue(etag, forHTTPHeaderField: "If-Match") }
-        do {
-            let response = try await transport.send(request, limit: Self.maxResponse)
-            guard response.body.count <= Self.maxResponse else { throw TailnetAPIError.invalidResponse }
-            return response
-        } catch { throw write ? TailnetAPIError.outcomeUnknown : TailnetAPIError.unavailable }
+        return request
     }
     private func accessToken(_ credential: OAuthCredential, scope: String) async throws -> String {
         guard (1...256).contains(credential.clientID.utf8.count), (1...4096).contains(credential.secret.utf8.count),
@@ -208,10 +225,21 @@ struct HTTPResult: Sendable {
     let headers: [String:String]
     let body: Data
 }
-protocol HTTPTransport: Sendable { func send(_ request: URLRequest, limit: Int) async throws -> HTTPResult }
+protocol HTTPTransport: Sendable {
+    func send(_ request: URLRequest, limit: Int) async throws -> HTTPResult
+    @MainActor func sendWrite(_ request: URLRequest, limit: Int, beforeDispatch: @escaping @MainActor () throws -> Void) async throws -> HTTPResult
+}
 private enum WireError: Error { case transport, oversized, response, redirect }
 
 private struct PinnedHTTPS: HTTPTransport {
+    @MainActor func sendWrite(_ request: URLRequest, limit: Int, beforeDispatch: @escaping @MainActor () throws -> Void) async throws -> HTTPResult {
+        guard request.url?.scheme == "https", request.url?.host == "api.tailscale.com", request.url?.port == nil,
+              request.url?.user == nil, request.url?.password == nil else { throw TailnetAPIError.notDispatched }
+        let operation = BoundedRequest(request: request, limit: limit)
+        return try await withTaskCancellationHandler(operation: {
+            try await operation.runWrite(beforeDispatch: beforeDispatch)
+        }, onCancel: { operation.cancel() })
+    }
     func send(_ request: URLRequest, limit: Int) async throws -> HTTPResult {
         guard request.url?.scheme == "https", request.url?.host == "api.tailscale.com", request.url?.port == nil,
               request.url?.user == nil, request.url?.password == nil else { throw WireError.response }
@@ -230,6 +258,8 @@ final class BoundedRequest: NSObject, URLSessionDataDelegate, @unchecked Sendabl
     private let lock = NSLock()
     private var task: URLSessionDataTask?
     private var cancelled = false
+    private var writeRequest = false
+    private var dispatched = false
     private var continuation: CheckedContinuation<HTTPResult, Error>?
     private var bytes = Data()
     private var response: HTTPURLResponse?
@@ -256,6 +286,31 @@ final class BoundedRequest: NSObject, URLSessionDataDelegate, @unchecked Sendabl
             self.session = session; let task = session.dataTask(with: request); self.task = task; task.resume()
         }
     }
+    @MainActor func runWrite(beforeDispatch: @escaping @MainActor () throws -> Void) async throws -> HTTPResult {
+        try await withCheckedThrowingContinuation { continuation in
+            lock.lock()
+            guard !cancelled else { lock.unlock(); continuation.resume(throwing: TailnetAPIError.notDispatched); return }
+            self.continuation = continuation; self.writeRequest = true
+            let queue = OperationQueue(); queue.maxConcurrentOperationCount = 1
+            let session = URLSession(configuration: Self.configuration(), delegate: self, delegateQueue: queue)
+            self.session = session
+            let task = session.dataTask(with: request); self.task = task
+            lock.unlock()
+            do {
+                try Task.checkCancellation()
+                try beforeDispatch()
+                // No await, executor/actor hop or user callback between the guard
+                // and resume. MainActor edits cannot interleave in this section.
+                lock.lock()
+                guard !cancelled, self.continuation != nil else { lock.unlock(); throw TailnetAPIError.notDispatched }
+                dispatched = true; task.resume(); lock.unlock()
+            } catch {
+                lock.lock(); let pending = self.continuation; self.continuation = nil; self.task = nil; self.session = nil; lock.unlock()
+                pending?.resume(throwing: TailnetAPIError.notDispatched)
+                session.invalidateAndCancel()
+            }
+        }
+    }
     func cancel() { lock.lock(); cancelled = true; let task = task; lock.unlock(); task?.cancel() }
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
         failure = WireError.redirect; completionHandler(nil)
@@ -275,15 +330,17 @@ final class BoundedRequest: NSObject, URLSessionDataDelegate, @unchecked Sendabl
         bytes.append(data)
     }
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        lock.lock(); let neverDispatched = writeRequest && !dispatched; lock.unlock()
         let result: Result<HTTPResult, Error>
-        if error != nil || failure != nil { result = .failure(failure ?? WireError.transport) }
+        if neverDispatched { result = .failure(TailnetAPIError.notDispatched) }
+        else if error != nil || failure != nil { result = .failure(failure ?? WireError.transport) }
         else if let response {
             var headers = [String:String]()
             for (key,value) in response.allHeaderFields { headers[String(describing: key).lowercased()] = String(describing: value) }
             result = .success(HTTPResult(status: response.statusCode, headers: headers, body: bytes))
         } else { result = .failure(WireError.response) }
-        lock.lock(); let continuation = continuation; self.continuation = nil; self.task = nil; lock.unlock()
-        continuation?.resume(with: result); session.finishTasksAndInvalidate(); self.session = nil
+        lock.lock(); let continuation = continuation; self.continuation = nil; self.task = nil; self.session = nil; lock.unlock()
+        continuation?.resume(with: result); session.finishTasksAndInvalidate()
     }
 }
 

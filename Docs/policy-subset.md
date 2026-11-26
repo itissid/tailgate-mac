@@ -8,6 +8,10 @@ The app obtains `vm` and `source` from human-controlled local configuration. `vm
 
 `occupiedTags` is a trusted complete inventory of existing device tags, including tags not present in `tagOwners`. The compiler independently checks policy definitions and inventory for reuse of the proposed tag, but cannot prove the caller supplied a complete or current inventory. The transport must obtain inventory itself; accepting the agent's list would defeat freshness checking. Policy ETag alone does not version inventory, so enrollment must also check freshness at execution and before authorizing the intended device.
 
+## Preflight before authentication
+
+`Compiler.validVM(_:)` and `Compiler.validSource(_:)` expose the same pure ASCII/name bounds used by live compilation so onboarding can reject invalid local configuration before storing credentials. `Compiler.preflightLive(proposal:vm:source:)` validates the entire proposal against those local pins and returns only the explicit `browser` or `key` mode. It needs no policy, inventory or credential and performs no I/O. Call it **before the first authenticated read**, not after fetching policy. A successful preflight does not establish tag freshness or policy compatibility; `compileLive` must still run against trusted fetched inputs.
+
 ## Proposal
 
 The schema is the same as the demo proposal, with an exact human-configured source and VM:

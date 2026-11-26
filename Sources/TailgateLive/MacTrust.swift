@@ -104,8 +104,8 @@ public enum MacTrustError: String, Error, LocalizedError {
     public func finishIntent(id: UUID, outcome: String) throws {
         guard ["applied", "rejected", "unknown"].contains(outcome) else { throw MacTrustError.invalidInput }
         let idText = id.uuidString.lowercased()
-        let lease = try read(slot: activeSlot)
-        guard lease.count == 68, lease.prefix(36) == Data(idText.utf8), try exists(slot: "intent-" + idText) else { throw MacTrustError.replay }
+        guard let lease = try activeLease(), lease.id == id,
+              try read(slot: "intent-" + idText) == lease.digest else { throw MacTrustError.replay }
         try add(slot: "intent-result-" + idText, data: Data(outcome.utf8))
         if outcome != "unknown" {
             guard SecItemDelete(query(slot: activeSlot) as CFDictionary) == errSecSuccess else { throw MacTrustError.unavailable }
@@ -116,13 +116,33 @@ public enum MacTrustError: String, Error, LocalizedError {
         if try exists(slot: activeSlot) { throw MacTrustError.unresolvedIntent }
     }
 
-    /// Read-only recovery hint. This does not clear a lock or authorize another POST.
-    public func unresolvedDigest() throws -> Data? {
-        let lease: Data
-        do { lease = try read(slot: activeSlot) }
+    /// Read-only recovery hints. Neither clears a lock nor authorizes another POST.
+    public func unresolvedDigest() throws -> Data? { try activeLease()?.digest }
+    public func unresolvedID() throws -> UUID? { try activeLease()?.id }
+
+    /// Authenticate a restoration receipt against immutable Keychain history, never
+    /// against the replaceable UI receipt. Wrong digests are an integrity error.
+    public func hasApplied(id: UUID, digest: Data) throws -> Bool {
+        guard digest.count == 32 else { throw MacTrustError.invalidInput }
+        let idText = id.uuidString.lowercased()
+        let history: Data
+        do { history = try read(slot: "intent-" + idText) }
+        catch MacTrustError.missing { return false }
+        guard history.count == 32, history == digest else { throw MacTrustError.replay }
+        let outcome: Data
+        do { outcome = try read(slot: "intent-result-" + idText) }
+        catch MacTrustError.missing { return false }
+        guard [Data("applied".utf8), Data("rejected".utf8), Data("unknown".utf8)].contains(outcome) else { throw MacTrustError.unavailable }
+        return outcome == Data("applied".utf8)
+    }
+
+    private func activeLease() throws -> (id: UUID, digest: Data)? {
+        let bytes: Data
+        do { bytes = try read(slot: activeSlot) }
         catch MacTrustError.missing { return nil }
-        guard lease.count == 68 else { throw MacTrustError.unresolvedIntent }
-        return Data(lease.suffix(32))
+        guard bytes.count == 68, let text = String(data: bytes.prefix(36), encoding: .utf8),
+              let id = UUID(uuidString: text), id.uuidString.lowercased() == text else { throw MacTrustError.unresolvedIntent }
+        return (id, Data(bytes.suffix(32)))
     }
 
     // MARK: Data Protection Keychain
@@ -203,9 +223,13 @@ public enum MacTrustError: String, Error, LocalizedError {
         guard bundle.bundleURL.pathExtension == "app", bundle.bundleURL.deletingLastPathComponent().path == "/Applications",
               bundle.bundleIdentifier == "dev.tailgate.mac",
               let team = bundle.object(forInfoDictionaryKey: "TailgateTeamIdentifier") as? String,
-              team.count == 10, team.utf8.allSatisfy({ (65...90).contains($0) || (48...57).contains($0) }),
-              let profile = bundle.url(forResource: "embedded", withExtension: "provisionprofile"),
-              FileManager.default.fileExists(atPath: profile.path) else { throw MacTrustError.untrustedApplication }
+              team.count == 10, team.utf8.allSatisfy({ (65...90).contains($0) || (48...57).contains($0) }) else { throw MacTrustError.untrustedApplication }
+        // Do not use resource lookup: it may resolve Resources/ or localized files
+        // rather than the profile location macOS validates for this executable.
+        let profile = bundle.bundleURL.appendingPathComponent("Contents/embedded.provisionprofile", isDirectory: false)
+        var profileStat = stat()
+        guard lstat(profile.path, &profileStat) == 0, profileStat.st_mode & S_IFMT == S_IFREG,
+              profileStat.st_size > 0 else { throw MacTrustError.untrustedApplication }
         // Reject agent-replaceable deployments. Installation is an explicit human/admin
         // operation. No helper, source checkout or user-writable development app is trusted.
         try validateRootOwnedTree(bundle.bundleURL)

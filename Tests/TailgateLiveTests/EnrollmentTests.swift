@@ -69,9 +69,28 @@ struct EnrollmentTests {
     @Test func missingOrUnpinnedDevicesNeverSubstituteLatestJoin() throws {
         var monitor = BrowserEnrollmentMonitor(plan: try plan())
         #expect(monitor.inspect(snapshot([]), now: start) == .waiting(.pinnedNodeNotPresent))
-        #expect(monitor.inspect(snapshot([device(key: "nodekey:" + String(repeating: "d", count: 64))]), now: start) == .waiting(.pinnedNodeNotPresent))
-        let missing = EnrollmentDeviceObservation(id: "n123example", nodeKey: nil, tags: [tag], authorized: true)
+        #expect(monitor.inspect(snapshot([device(key: "nodekey:" + String(repeating: "d", count: 64), tags: [])]), now: start) == .waiting(.pinnedNodeNotPresent))
+        let missing = EnrollmentDeviceObservation(id: "n123example", nodeKey: nil, tags: [], authorized: true)
         #expect(monitor.inspect(snapshot([missing]), now: start) == .waiting(.pinnedNodeNotPresent))
+    }
+    @Test func destinationTagOnAnyNonPinnedNodeStopsBeforeWaitingOrVerifying() throws {
+        let otherKey = "nodekey:" + String(repeating: "d", count: 64)
+        let otherNodes = [
+            device(id: "nOther", key: otherKey),
+            device(id: "nOther", key: otherKey, tags: ["tag:unrelated", tag, "tag:another"], authorized: false),
+            EnrollmentDeviceObservation(id: "nOther", nodeKey: nil, tags: [tag], authorized: true)
+        ]
+        for other in otherNodes {
+            for pinned in [[EnrollmentDeviceObservation](), [device()], [device(tags: [])], [device(authorized: false)]] {
+                var monitor = BrowserEnrollmentMonitor(plan: try plan())
+                #expect(monitor.inspect(snapshot(pinned + [other]), now: start) == .stopped(.destinationTagConflict))
+                #expect(monitor.inspect(snapshot([device()]), now: start) == .stopped(.destinationTagConflict))
+            }
+            var stale = BrowserEnrollmentMonitor(plan: try plan())
+            #expect(stale.inspect(snapshot([other]), now: start.addingTimeInterval(60)) == .stopped(.destinationTagConflict))
+        }
+        var unrelated = BrowserEnrollmentMonitor(plan: try plan())
+        #expect(unrelated.inspect(snapshot([device(id: "nOther", key: otherKey, tags: ["tag:unrelated"])]), now: start) == .waiting(.pinnedNodeNotPresent))
     }
     @Test func unauthorizedNodeWaitsWithoutAuthorizingIt() throws {
         var monitor = BrowserEnrollmentMonitor(plan: try plan())
@@ -92,7 +111,7 @@ struct EnrollmentTests {
     }
     @Test func wrongDeviceIDOrRotatedNodeKeyStops() throws {
         var rotated = BrowserEnrollmentMonitor(plan: try plan(deviceID: "n123example"))
-        #expect(rotated.inspect(snapshot([device(key: "nodekey:" + String(repeating: "e", count: 64))]), now: start) == .stopped(.identityChanged))
+        #expect(rotated.inspect(snapshot([device(key: "nodekey:" + String(repeating: "e", count: 64), tags: [])]), now: start) == .stopped(.identityChanged))
         var swapped = BrowserEnrollmentMonitor(plan: try plan(deviceID: "n123example"))
         #expect(swapped.inspect(snapshot([device(id: "nDifferent")]), now: start) == .stopped(.identityChanged))
     }
@@ -100,7 +119,7 @@ struct EnrollmentTests {
         var sameKey = BrowserEnrollmentMonitor(plan: try plan())
         #expect(sameKey.inspect(snapshot([device(), device(id: "nOther")]), now: start) == .stopped(.ambiguousIdentity))
         var sameID = BrowserEnrollmentMonitor(plan: try plan())
-        #expect(sameID.inspect(snapshot([device(), device(key: "nodekey:" + String(repeating: "e", count: 64))]), now: start) == .stopped(.ambiguousIdentity))
+        #expect(sameID.inspect(snapshot([device(), device(key: "nodekey:" + String(repeating: "e", count: 64), tags: [])]), now: start) == .stopped(.ambiguousIdentity))
     }
     @Test func policyMustMatchBeforeAndAfterInventoryRead() throws {
         let cases = [snapshot([device()], before: "\"old\""), snapshot([device()], after: "\"new\""),

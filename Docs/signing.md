@@ -18,7 +18,7 @@ Scripts/package-app.sh \
   YOURTEAMID /path/to/distribution.provisionprofile dist
 ```
 
-The script checks the profile's explicit app ID, team, distribution type, keychain authorization and expiration; builds the release executable; embeds the profile; substitutes team values into the tracked plist templates; signs with hardened runtime; and checks the code seal. It refuses to overwrite an existing output bundle. It never reads OAuth credentials, installs, or launches the app. Profile decoding and a successful local signature check are not a substitute for Apple's runtime profile validation or notarization.
+The script checks the profile's explicit app ID, team, distribution type, keychain authorization and expiration using unconditional checks (not Python assertions); builds the release executable; embeds the profile at exactly `Contents/embedded.provisionprofile`; substitutes team values into the tracked plist templates; and signs with hardened runtime. It independently checks the resulting signature against the requested Developer ID/team/app-ID requirement and reads back the artifact's team, identifier, hardened flags and exact entitlements. It refuses an existing output bundle. It never reads OAuth credentials, installs, or launches the app. Profile decoding and a successful local signature check are not a substitute for Apple's runtime profile validation or notarization.
 
 Use your independently configured Apple notarization credential profile (never an OAuth secret):
 
@@ -29,19 +29,18 @@ xcrun stapler staple dist/Tailgate.app
 spctl --assess --type execute --verbose=2 dist/Tailgate.app
 ```
 
-Have an administrator install the reviewed app, without merging an older bundle. Quit any existing instance first. The following is a **human-run** example for a fresh installation (it deliberately refuses an existing destination):
+### Administrative installation is a separate fail-stop operation
 
-```sh
-sudo test ! -e /Applications/Tailgate.app && \
-  sudo ditto dist/Tailgate.app /Applications/Tailgate.app
-sudo chown -R root:wheel /Applications/Tailgate.app
-sudo chmod -RN /Applications/Tailgate.app
-sudo chmod -R a+rX,go-w /Applications/Tailgate.app
-codesign --verify --deep --strict --verbose=2 /Applications/Tailgate.app
-open /Applications/Tailgate.app
-```
+There is intentionally **no privileged copy/chown/chmod recipe or automatic installer** in this repository. A recursive privileged command against a user-writable source or destination can follow substituted paths or change an existing installation after an earlier check failed. Do not run the packager as root or promote a build tree directly into `/Applications`.
 
-Do not execute these commands blindly if another Tailgate app already exists. Root ownership, absence of writable group/world permissions and ACLs, and no symlinks are checked recursively on launch. Developer ID signature requirement, exact private access-group entitlement, app sandbox, network-client entitlement, user-selected-read-only entitlement and debugger absence are also checked. The only file-access entitlement is `com.apple.security.files.user-selected.read-only`: the human chooses a local `.tailgate` proposal using `NSOpenPanel`. There are no ambient-home reads, automatic imports, file-write entitlements or broad filesystem permissions. The app accepts no extra signing entitlements, including debugger access, disabled library validation, shared application groups or unsigned executable memory. The normal sandbox container remains writable for UI state, but it cannot replace root-owned code or grant another process the private access group.
+Have an independent human administrator perform the installation with the platform's reviewed administrative deployment tooling:
+
+1. Obtain the expected Developer ID team and app ID independently—from your Apple account and reviewed release record, **not** from the candidate app's plist, a script printed by the agent, or an arbitrary certificate it presents. Verify the notarization assessment, code seal, expected signer requirement, exact entitlements and release provenance before accepting the artifact.
+2. Copy the reviewed artifact into administrator-controlled staging without following symlinks. Reverify the same signature and expected identity in that protected staging area. Ensure an untrusted user cannot replace the source between verification and installation.
+3. Quit existing instances. If `/Applications/Tailgate.app` already exists, is a symlink, has an unexpected owner, or any precondition/verification fails, **stop**. An upgrade is a separate reviewed replacement operation; do not merge contents, recursively alter an unknown bundle, or continue with later permission commands after a failed step.
+4. Install from protected staging as a root-owned bundle with no writable group/world bits, symlinks or extended ACL entries. Preserve the existing Keychain items and journal. Verify the installed artifact again against the independently known team/app ID and assess notarization before first launch. If verification fails, stop without launching or entering credentials.
+
+The release script checks signing but does not grant trust to an attacker-chosen team: the administrator's independent expected signer is the trust anchor. Root ownership only protects the installed bytes; it does not make arbitrary signed code trustworthy. Root ownership, absence of writable group/world permissions and ACLs, and no symlinks are checked recursively on launch. Developer ID signature requirement, exact private access-group entitlement, app sandbox, network-client entitlement, user-selected-read-only entitlement and debugger absence are also checked. The only file-access entitlement is `com.apple.security.files.user-selected.read-only`: the human chooses a local `.tailgate` proposal using `NSOpenPanel`. There are no ambient-home reads, automatic imports, file-write entitlements or broad filesystem permissions. The app accepts no extra signing entitlements, including debugger access, disabled library validation, shared application groups or unsigned executable memory. The normal sandbox container remains writable for UI state, but it cannot replace root-owned code or grant another process the private access group.
 
 ## What Keychain stores
 
@@ -56,7 +55,7 @@ All items use the **Data Protection Keychain**, `WhenUnlockedThisDeviceOnly`, no
 | `intent-UUID` | Immutable digest history prevents reuse of the same request ID, including after restart. |
 | `intent-result-UUID` | Immutable `applied`, `rejected` or `unknown` outcome. Unknown does not release the active lock. |
 
-Only `configuration` and `receipt` are exposed by `store`/`load`. Missing items throw `MacTrustError.missing`; inaccessible/corrupt store is an error, not “not configured.” Reserve a write intent **before any write-capable network call**. On a definite `applied` or definite no-write `rejected` result, record the outcome then release the active lock; a crash or unknown result remains blocked. `unresolvedDigest()` permits read-only reconciliation but grants no lock-clearing operation. Never classify a timeout or an ambiguous server response as rejected. Merely restarting the app or reprovisioning cannot unlock the journal.
+Only `configuration` and `receipt` are exposed by `store`/`load`. Missing items throw `MacTrustError.missing`; inaccessible/corrupt store is an error, not “not configured.” Reserve a write intent **before any write-capable network call**. On a definite `applied` or definite no-write `rejected` result, record the outcome then release the active lock; a crash or unknown result remains blocked. `unresolvedID()` and `unresolvedDigest()` permit read-only reconciliation but grant no lock-clearing operation. Restoring a mutable UI receipt must call `hasApplied(id:digest:)`, which requires matching immutable per-ID history and an immutable `applied` outcome. `finishIntent` checks that the active lease digest exactly equals the immutable per-ID digest before recording any result or releasing its lock. Never classify a timeout or an ambiguous server response as rejected. Merely restarting the app or reprovisioning cannot unlock the journal.
 
 The credential-bearing app verifies the plan signature against the pinned public key and checks deadline, exact target, operation, policy version and single-use identifier before using a token. Touch ID authenticates a user for the local enclave operation. Tailscale sees an OAuth token, **not** the enclave public key or biometric proof. A stolen OAuth credential bypasses this local gate; Keychain access isolation, signed code integrity and the release process remain trusted assumptions.
 

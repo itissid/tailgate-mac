@@ -5,15 +5,22 @@ import Testing
 private actor ScriptedWire: HTTPTransport {
     private var results: [Result<HTTPResult,Error>]
     private(set) var requests = [URLRequest]()
-    init(_ results: [Result<HTTPResult,Error>]) { self.results = results }
+    private let beforeTokenReturn: (@MainActor @Sendable () -> Void)?
+    init(_ results: [Result<HTTPResult,Error>], beforeTokenReturn: (@MainActor @Sendable () -> Void)? = nil) { self.results = results; self.beforeTokenReturn = beforeTokenReturn }
+    @MainActor func sendWrite(_ request: URLRequest, limit: Int, beforeDispatch: @escaping @MainActor () throws -> Void) async throws -> HTTPResult {
+        do { try beforeDispatch() } catch { throw TailnetAPIError.notDispatched }
+        return try await send(request, limit: limit)
+    }
     func send(_ request: URLRequest, limit: Int) async throws -> HTTPResult {
         requests.append(request)
         guard !results.isEmpty else { throw TestFault.offline }
         let response = try results.removeFirst().get()
+        if request.url?.path == "/api/v2/oauth/token", let hook = beforeTokenReturn { await hook() }
         return response
     }
 }
-private enum TestFault: Error { case offline }
+private enum TestFault: Error { case offline, invalidated }
+@MainActor private final class ApprovalState { var current = true; var guardCalls = 0 }
 private func reply(_ body: String = "", status: Int = 200, headers: [String:String] = [:]) -> Result<HTTPResult,Error> {
     .success(HTTPResult(status: status, headers: headers, body: Data(body.utf8)))
 }
@@ -70,7 +77,7 @@ struct TransportTests {
     }
     @Test func applySendsExactIfMatchAndWriteScope() async throws {
         let wire = ScriptedWire([token,reply(String(decoding:candidate,as:UTF8.self),headers:policyHeaders)])
-        let result = try await TailnetAPI(tailnet:"example.com",transport:wire).apply(candidate,ifMatch:"\"old\"",using:credential)
+        let result = try await TailnetAPI(tailnet:"example.com",transport:wire).apply(candidate,ifMatch:"\"old\"",using:credential,beforeDispatch: {})
         #expect(result.etag == "\"v1\"")
         let requests = await wire.requests
         #expect(requests[1].httpBody == candidate); #expect(requests[1].value(forHTTPHeaderField:"If-Match") == "\"old\"")
@@ -78,27 +85,58 @@ struct TransportTests {
     }
     @Test func invalidWriteNeverFetchesToken() async throws {
         let wire = ScriptedWire([]), api = try TailnetAPI(tailnet:"example.com",transport:wire)
-        await #expect(throws:TailnetAPIError.invalidInput) { try await api.apply(candidate,ifMatch:"*",using:credential) }
+        await #expect(throws:TailnetAPIError.invalidInput) { try await api.apply(candidate,ifMatch:"*",using:credential,beforeDispatch: {}) }
         await #expect(throws:TailnetAPIError.invalidInput) { try await api.validate(Data("[]".utf8),using:credential) }
-        await #expect(throws:TailnetAPIError.invalidInput) { try await api.apply(Data(repeating:123,count:1_048_577),ifMatch:"\"x\"",using:credential) }
+        await #expect(throws:TailnetAPIError.invalidInput) { try await api.apply(Data(repeating:123,count:1_048_577),ifMatch:"\"x\"",using:credential,beforeDispatch: {}) }
         #expect(await wire.requests.isEmpty)
+    }
+    @MainActor @Test func tokenAcquisitionInvalidationPreventsDispatch() async throws {
+        let state = ApprovalState()
+        let wire = ScriptedWire([token,reply("{}",headers:policyHeaders)],beforeTokenReturn: { state.current = false })
+        let api = try TailnetAPI(tailnet:"example.com",transport:wire)
+        await #expect(throws:TailnetAPIError.notDispatched) {
+            try await api.apply(candidate,ifMatch:"\"old\"",using:credential,beforeDispatch: {
+                state.guardCalls += 1
+                guard state.current else { throw TestFault.invalidated }
+            })
+        }
+        #expect(state.guardCalls == 1)
+        let requests = await wire.requests
+        #expect(requests.count == 1)
+        #expect(requests[0].url?.path == "/api/v2/oauth/token")
+        #expect(!requests.contains(where: { $0.url?.path.hasSuffix("/acl") == true && $0.httpMethod == "POST" }))
+    }
+    @MainActor @Test func productionDispatchGuardFailureNeverResumesPolicyTask() async throws {
+        let request = URLRequest(url:URL(string:"https://api.tailscale.com/api/v2/tailnet/example.com/acl")!)
+        let operation = BoundedRequest(request:request,limit:4096)
+        await #expect(throws:TailnetAPIError.notDispatched) {
+            try await operation.runWrite(beforeDispatch: { throw TestFault.invalidated })
+        }
+    }
+    @Test func inventoryContinuationHeadersAndPartialStatusAreRejected() async throws {
+        for headers in [["link":"<https://api.tailscale.com/page2>; rel=next"],["content-range":"items 0-9/100"],["x-next-page":"2"],["x-continuation-token":"opaque"],["x-pagination-total":"100"],["Link":"anything"]] {
+            let api = try TailnetAPI(tailnet:"example.com",transport:ScriptedWire([token,reply("{\"devices\":[]}",headers:headers)]))
+            await #expect(throws:TailnetAPIError.invalidResponse) { try await api.devices(using:credential) }
+        }
+        let api = try TailnetAPI(tailnet:"example.com",transport:ScriptedWire([token,reply("{\"devices\":[]}",status:206)]))
+        await #expect(throws:TailnetAPIError.rejected(206)) { try await api.devices(using:credential) }
     }
     @Test func staleWriteIsNeverRetried() async throws {
         let wire = ScriptedWire([token,reply("secret",status:412)])
-        await #expect(throws:TailnetAPIError.stalePolicy) { try await TailnetAPI(tailnet:"example.com",transport:wire).apply(candidate,ifMatch:"\"v0\"",using:credential) }
+        await #expect(throws:TailnetAPIError.stalePolicy) { try await TailnetAPI(tailnet:"example.com",transport:wire).apply(candidate,ifMatch:"\"v0\"",using:credential,beforeDispatch: {}) }
         #expect(await wire.requests.count == 2)
     }
     @Test func ambiguousWritesAreUnknownAndNeverRetried() async throws {
         let outcomes: [Result<HTTPResult,Error>] = [.failure(TestFault.offline),reply("error-secret",status:500),reply("",status:200),reply("{}",status:200,headers:["etag":"W/\"weak\"","content-type":"application/hujson"]),reply("",status:302),reply("",status:429)]
         for outcome in outcomes {
             let wire = ScriptedWire([token,outcome])
-            await #expect(throws:TailnetAPIError.outcomeUnknown) { try await TailnetAPI(tailnet:"example.com",transport:wire).apply(candidate,ifMatch:"\"old\"",using:credential) }
+            await #expect(throws:TailnetAPIError.outcomeUnknown) { try await TailnetAPI(tailnet:"example.com",transport:wire).apply(candidate,ifMatch:"\"old\"",using:credential,beforeDispatch: {}) }
             #expect(await wire.requests.count == 2)
         }
     }
     @Test func rejectedWriteDoesNotEchoBody() async throws {
         let wire = ScriptedWire([token,reply("fake-secret-never-live",status:400)])
-        do { _ = try await TailnetAPI(tailnet:"example.com",transport:wire).apply(candidate,ifMatch:"\"old\"",using:credential); Issue.record("Expected rejection") }
+        do { _ = try await TailnetAPI(tailnet:"example.com",transport:wire).apply(candidate,ifMatch:"\"old\"",using:credential,beforeDispatch: {}); Issue.record("Expected rejection") }
         catch { #expect(error as? TailnetAPIError == .rejected(400)); #expect(!error.localizedDescription.contains("fake-secret")) }
     }
     @Test func oauthIsRedactedAndMalformedCredentialsNeverSend() async throws {
