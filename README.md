@@ -21,6 +21,10 @@ swift run TailgateReview                                   # starts in offline m
 
 The offline example allows `tag:demo-client` → `tag:workload-demo-api` on **TCP 443** and tests that **TCP 22 and 80 remain denied**. The offline demo also models a separately approved key request and delivery failure without creating a bearer key. None of the demo, preview or automated tests needs OAuth or writes to a tailnet.
 
+### Try the agent-to-human approval loop for free
+
+An agent can run `Scripts/tailgate-trial --stdin < Examples/browser.tailgate` (or `--example`) and wait for your decision. The separate **TailgateTrial** window shows the demo diff and an explicit Touch ID button. Its single JSON receipt is always marked `dry_run:true` and `write_outcome:"not_attempted"`, even if you approve. It has no live module, credential setup, Keychain storage, or Tailscale transport. No paid Apple account or installation is needed. This exercises the approval interaction, **not** credential isolation under a private signing certificate.
+
 ## Agent → human → Tailscale
 
 ```mermaid

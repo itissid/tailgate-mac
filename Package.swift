@@ -5,12 +5,14 @@ let package = Package(
     name: "TailgateMac", platforms: [.macOS(.v13)],
     products: [
         .executable(name: "TailgateReview", targets: ["TailgateReview"]),
+        .executable(name: "TailgateTrial", targets: ["TailgateTrial"]),
         .executable(name: "tailgate-preview", targets: ["TailgatePreview"])
     ],
     targets: [
         .target(name: "TailgateCore"),
         .target(name: "TailgateLive", dependencies: ["TailgateCore"]),
         .executableTarget(name: "TailgateReview", dependencies: ["TailgateCore", "TailgateLive"]),
+        .executableTarget(name: "TailgateTrial", dependencies: ["TailgateCore"]),
         .executableTarget(name: "TailgatePreview", dependencies: ["TailgateCore"]),
         .testTarget(name: "TailgateCoreTests", dependencies: ["TailgateCore"]),
         .testTarget(name: "TailgateLiveTests", dependencies: ["TailgateLive", "TailgateCore"])

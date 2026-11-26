@@ -1,0 +1,10 @@
+#!/bin/sh
+# Offline checkout rehearsal only. Never route a trial to the installed live app.
+set -eu
+if [ "$#" -ne 1 ]; then printf '%s\n' 'Usage: Scripts/tailgate-trial --example | --stdin' >&2; exit 64; fi
+case "$1" in --example|--stdin) ;; *) printf '%s\n' 'Expected --example or --stdin.' >&2; exit 64;; esac
+if [ "$(/usr/bin/id -u)" = 0 ]; then printf '%s\n' 'Run the trial as the normal GUI user, not root.' >&2; exit 64; fi
+base=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
+/usr/bin/swift build --package-path "$base" -c release --product TailgateTrial </dev/null >&2
+bin=$(/usr/bin/swift build --package-path "$base" -c release --show-bin-path </dev/null)
+exec "$bin/TailgateTrial" "$1"
