@@ -1,0 +1,54 @@
+/* Embedded by Scripts/atlas-vocabulary.py; use the field guide's own tokens. */
+[data-atlas-term="1"] {
+  text-decoration-line: underline;
+  text-decoration-style: dotted;
+  text-decoration-thickness: 1px;
+  text-underline-offset: .18em;
+}
+.atlas-terms-ready [data-atlas-term="1"] { cursor: help; }
+.atlas-terms-ready [data-atlas-term="1"]:hover,
+.atlas-terms-ready [data-atlas-term="1"][aria-expanded="true"] {
+  text-decoration-style: solid;
+  text-decoration-thickness: 2px;
+}
+[data-atlas-term="1"]:focus-visible {
+  outline: 3px solid var(--remote, #20568a);
+  outline-offset: 3px;
+  text-decoration-style: solid;
+}
+/* No font, padding, stroke or positioning changes on diagram text. */
+#atlas-term-popup {
+  position: fixed;
+  z-index: 1000;
+  width: min(360px, calc(100vw - 24px));
+  max-height: calc(100vh - 24px);
+  overflow: auto;
+  padding: 12px 15px;
+  border: 1px solid var(--rule, #c9c7be);
+  border-top: 3px solid var(--remote, #20568a);
+  border-radius: 3px;
+  background: var(--paper, #fffefa);
+  color: var(--ink, #182431);
+  box-shadow: 0 5px 22px #18243124;
+  font: 14px/1.5 var(--sans, system-ui, sans-serif);
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+#atlas-term-popup[hidden] { display: none; }
+#atlas-term-popup strong { display: block; margin-bottom: 4px; font-size: 16px; }
+#atlas-term-popup .atlas-term-source { display: block; margin-top: 7px; color: var(--sub, #4b575c); font-size: 12px; }
+.atlas-glossary { max-width: 1056px; margin: 38px auto; padding-inline: clamp(16px, 4.6vw, 62px); }
+.atlas-glossary > p { color: var(--sub, #4b575c); font-size: 14px; }
+.atlas-glossary dl { margin-top: 18px; }
+.atlas-glossary dt { font-weight: 650; margin-top: 12px; break-after: avoid; }
+.atlas-glossary dd { margin: 3px 0 0; max-width: 87ch; }
+@media (prefers-reduced-motion: reduce) {
+  #atlas-term-popup { scroll-behavior: auto; }
+}
+@media print {
+  #atlas-term-popup { display: none !important; }
+  [data-atlas-term="1"] { text-decoration: none; outline: none; }
+  .atlas-glossary { display: block; max-width: none; padding: 0; margin-top: 22pt; }
+  .atlas-glossary h2 { font-size: 22pt; }
+  .atlas-glossary dt, .atlas-glossary dd { break-inside: avoid; }
+}
