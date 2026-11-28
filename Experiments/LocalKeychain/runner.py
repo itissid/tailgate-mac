@@ -24,9 +24,17 @@ def summary(status, *, stage, codes=None):
 
 def classify_case(results):
     """Only A/A, B/B, B/A, A/B, A/A, B/B establishes the controls and denials."""
-    if len(results) != 6:
+    return classify_reads(results, ["ok", "ok", "denied", "denied", "ok", "ok"])
+
+
+def classify_update(results):
+    """A1/A, A2/A, B/B, B/A, A1/B, A2/B, A1/A, A2/A, B/B."""
+    return classify_reads(results, ["ok", "ok", "ok", "denied", "denied", "denied", "ok", "ok", "ok"])
+
+
+def classify_reads(results, expected):
+    if len(results) != len(expected):
         return "inconclusive"
-    expected = ["ok", "ok", "denied", "denied", "ok", "ok"]
     for result, status in zip(results, expected):
         if not isinstance(result, dict):
             return "inconclusive"
@@ -143,6 +151,65 @@ def fixture_test(arguments, verifier):
     return summary(classify_case(results), stage="identity-acl", codes=[r.get("osstatus") for r in results])
 
 
+def update_test(arguments, verifier):
+    """Consume explicitly supplied signed fixtures; never create an identity.
+
+    Different private paths are mandatory. An A2 success must not be explainable
+    solely by replacing A1 at a previously trusted pathname.
+    """
+    def result(status, stage, codes=None):
+        value = summary(status, stage=stage, codes=codes)
+        value["update_access_observed"] = status == "passed"
+        return value
+    if len(arguments) != 7:
+        return result("inconclusive", "update-arguments")
+    if os.environ.get("TAILGATE_DISPOSABLE_LAB") != "1":
+        return result("blocked", "isolated-fixtures-required")
+    try:
+        root = safe_root(arguments[0])
+        first, second, unrelated, keychain = [in_root(root, p) for p in arguments[1:5]]
+        pin_a, pin_b = arguments[5:]
+        if (any(len(pin) != 64 or any(c not in "0123456789abcdef" for c in pin)
+                for pin in (pin_a, pin_b)) or pin_a == pin_b or
+                len({first, second, unrelated}) != 3 or
+                any(app.name != "KeychainProbe.app" for app in (first, second, unrelated))):
+            raise ValueError("identity")
+        binaries = [app / "Contents/MacOS/KeychainProbe" for app in (first, second, unrelated)]
+        for binary in binaries:
+            in_root(root, str(binary))
+        if len({(p.stat().st_dev, p.stat().st_ino) for p in binaries}) != 3:
+            raise ValueError("identity")
+    except FileNotFoundError:
+        return result("blocked", "update-fixtures-missing")
+    except (ValueError, OSError):
+        return result("inconclusive", "update-fixtures-invalid")
+    evidence = [str(root), str(first), str(second), str(unrelated), str(keychain), pin_a, pin_b]
+    def control(binary, mode):
+        code, raw = command([str(binary), mode] + evidence)
+        return code == 0 and strict_result(raw)["status"] == "ok"
+    try:
+        if not control(verifier, "--verify-update"):
+            return result("inconclusive", "update-signature-controls")
+        if not control(binaries[0], "--seed-update"):
+            return result("inconclusive", "update-item-setup")
+        reads = []
+        for binary, account in [(binaries[0], "a"), (binaries[1], "a"), (binaries[2], "b"),
+                                (binaries[2], "a"), (binaries[0], "b"), (binaries[1], "b"),
+                                (binaries[0], "a"), (binaries[1], "a"), (binaries[2], "b")]:
+            code, raw = command([str(binary), "--read", str(root), str(keychain), account], timeout=10)
+            observed = strict_result(raw)
+            if code != 0 and observed["status"] != "inconclusive":
+                return result("inconclusive", "update-reader-process")
+            reads.append(observed)
+        # Detect altered fixtures between preflight and actual reads, not merely
+        # an unchanged filename. Never reuse an earlier successful control result.
+        if not control(verifier, "--verify-update"):
+            return result("inconclusive", "update-signature-controls")
+        return result(classify_update(reads), "update-identity-acl", [r.get("osstatus") for r in reads])
+    except (Exception, KeyboardInterrupt):
+        return result("inconclusive", "update-process")
+
+
 def main(args):
     if not args or args == ["--preflight"]:
         return summary("blocked", stage="codesign-may-consult-user-search-list")
@@ -157,6 +224,8 @@ def main(args):
             return summary("offline-checks-passed", stage="compile-and-classifier")
         if args[:1] == ["--fixtures"]:
             return fixture_test(args[1:], probe)
+        if args[:1] == ["--update-fixtures"]:
+            return update_test(args[1:], probe)
         return summary("inconclusive", stage="arguments")
 
 

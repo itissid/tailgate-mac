@@ -123,6 +123,90 @@ trust replacement certificates. All dynamic error payloads, paths, certificate
 names, fingerprints and dummy bytes are withheld from stdout/stderr. It returns a
 small JSON summary with numeric OSStatus where relevant, never the credential.
 
+## Opt-in: does a same-identity code update retain access?
+
+This is an additional **unexecuted acceptance procedure**, not a conclusion that
+Tailgate's no-fee deployment works. Certificate Assistant creates a signing
+identity once; each changed build still needs its own signature. This test asks
+whether keeping that identity and designated requirement stable lets a new build
+read the existing dummy item without recreating an identity, changing its ACL,
+or reprovisioning OAuth. No real OAuth credentials participate.
+
+Supply **already signed** fixtures in an isolated lab account/VM:
+
+- `A1_APP`: the original `KeychainProbe.app` containing this helper.
+- `A2_APP`: a genuinely recompiled version of the helper with a meaningful code
+  change (for example, an extra executed self-test assertion), signed with the
+  **same exact certificate** as A1. Merely changing a plist, resource, timestamp,
+  signature options or executable filename is not sufficient. Both builds must
+  support the same `--read` protocol; A1 must support `--seed-update`.
+- `B_APP`: the helper signed by a different valid certificate and public key,
+  with the same app name and bundle identifier as A1/A2.
+- An existing, empty private dummy Keychain, plus private `password.bin` and
+  `dummy.bin` as described above. Use fresh dummy items for this run; duplicate
+  setup is inconclusive, not an update of existing items.
+- Independently reviewed SHA-256 fingerprints of the exact leaf certificate for
+  A and B: 64 lowercase hexadecimal digits, obtained from the lab certificates,
+  not derived automatically from whichever app happens to be at the path.
+
+Run, after substituting the fixture paths and fingerprints:
+
+```sh
+TAILGATE_DISPOSABLE_LAB=1 Experiments/LocalKeychain/run.sh \
+  --update-fixtures LAB_ROOT A1_APP A2_APP B_APP DUMMY_KEYCHAIN PIN_A PIN_B
+```
+
+All three apps must live at **different private paths** beneath `LAB_ROOT`, with
+separate regular executable files (no hardlinks) and final name
+`KeychainProbe.app`. Executables must be user-only readable/executable (mode 0700),
+like the mode-0600 dummy files. Neither a same-path overwrite nor an ACL amendment
+is performed by this driver. A2 reading an item seeded for A1 **at a different
+pathname** is the stronger control against success attributable only to retaining
+a previously trusted path. A failure at a different path is inconclusive for an
+in-place update; this test does not claim to cover atomic installation, app
+replacement, all macOS releases or code-requirement migration.
+
+Before touching the dummy items, the verifier requires valid explicit
+certificate-pinned signatures for all apps, the common bundle identifier, the
+same pinned certificate/public key for A1/A2, a distinct pinned B identity,
+different executable **CDHashes** and different compiled `__TEXT,__text`
+instruction-section SHA-256 hashes for A1/A2, and identical serialized designated
+requirements. Byte-identical requirements are a conservative sufficient condition
+for equivalence; logically equivalent requirements encoded differently are
+rejected as inconclusive. The code parser supports only bounded thin 64-bit,
+same-architecture Mach-O executables. Fat/unrecognized executables or
+resource-only changes are invalid fixture setup, not an access-denial PASS.
+Different instruction bytes are evidence of a code change, not proof that the
+operator chose a useful change or that an updated app is safe.
+
+The driver seeds A's item using **A1 only** and B's using B, never adds A2 to an
+ACL, then performs these noninteractive reads against the same explicit store:
+
+| Order | Read | Required result |
+|---|---|---|
+| 1–3 | A1 → A item; A2 → A item; B → B item | All return the exact dummy bytes |
+| 4–6 | B → A item; A1 → B item; A2 → B item | Each is denied with a recognized authorization status |
+| 7–9 | Repeat all three positive reads | All still return the exact dummy bytes |
+
+Signature/code/requirement controls are rechecked afterward. The helper never
+prints dummy bytes or dynamically trusts a new identity. A passing redacted
+summary has `stage: "update-identity-acl"` and
+`update_access_observed: true`. `update-fixtures-missing` is **blocked** (supply the
+existing signed fixtures; the driver never creates an identity);
+`update-fixtures-invalid`, signature failures and broken positive controls are
+**inconclusive**. An unexpected successful cross-read is **failed**. No failure
+is solved by broadening the ACL, changing trust settings or switching to ad-hoc
+signing. Fixture source and paths must remain frozen during the run.
+
+The offline self-test also checks the instruction-section parser with synthetic
+bytes (instruction change differs, header-only change does not, invalid bounds
+reject). Those checks and mocked Python sequencing tests are **not** observations
+of real signed-app or Keychain enforcement. Even a real PASS establishes only
+this dummy credential/update experiment, not fresh biometrics, the enclave key,
+journal freshness or a secure installation/signing-key custody process. Keep the
+signing key out of the untrusted agent's control; a stable identity intentionally
+extends trust to future builds signed by that identity.
+
 ## Limits
 
 - The legacy APIs are deprecated; availability and behavior must be observed on
