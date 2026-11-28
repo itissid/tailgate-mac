@@ -1,6 +1,17 @@
 # Observed result
 
-## Scope
+## On-device follow-up — locally signed, dummy data only
+
+Using the probe from revision `71a51e4`, two real builds (v1 and v2) were signed with the same operator-controlled certificate. Both had the same bundle ID and explicit certificate-pinned designated requirement, different signed code hashes, and different machine instructions. All reader processes had Keychain UI disabled. No live OAuth credentials or Tailscale API were involved.
+
+- **Initial read:** A fresh file-based Keychain held one random dummy item with its read rule naming v1. The signed v1 app returned success only after comparing all retrieved bytes with the test oracle.
+- **Update:** In a new temporary store, the fixture added one item for v1, then ran v1 → v2 → v1 against the unchanged item. All three reads returned success without a prompt, at distinct bundle paths for the two versions.
+- **Negative control:** A different, ad-hoc-signed build with the same name and bundle ID had a separate item in the same fresh fixture. Both apps read their own item before and after the cross-reads. Neither app read the other’s item (`errSecAuthFailed`, −25293). This specifically tests an ad-hoc copy, not a copy signed using the operator’s release key, and not a second trusted certificate.
+- **Cleanup:** The fixture Keychains and dummy values were removed; the user Keychain search-list snapshot matched the original after testing.
+
+These observations are evidence for *noninteractive access to these file-based dummy items*, not proof of Secure Enclave behavior, resistance to journal rollback, protection against misuse of the signing key, or authenticated live Tailscale operations. A separate clean build of the review app was signed and verified for local offline review only; it was not given the production app identity or a Keychain entitlement.
+
+## Earlier offline-only run
 
 Run in the development account, without signing identities, certificate imports,
 Keychain creation/opening/reads/writes, trust settings, search-list changes, GUI
@@ -41,9 +52,9 @@ labeled a failure instead of inconclusive; ordering was fixed and the complete
 focused suite then passed. This is a harness correction, not evidence about
 Keychain enforcement.
 
-## What remains unobserved
+## Limits of the earlier offline-only run
 
-**Signer isolation: NOT OBSERVED.** No certificate-backed A/B binaries were signed
+**Signer isolation was not observed in that earlier run.** No certificate-backed A/B binaries were signed
 or exercised. No actual dummy-item read/write was done, because no existing
 isolated fixture was supplied and search-list-neutral creation was not established.
 The installed `codesign` man page says its explicit `--keychain` still consults
